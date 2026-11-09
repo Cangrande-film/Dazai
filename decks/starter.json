@@ -1,0 +1,13 @@
+{
+  "name": "Word bank",
+  "cards": [
+    {
+      "word": "新幹線",
+      "readings": [
+        "しんかんせん"
+      ],
+      "meaning": "bullet train; shinkansen",
+      "notes": "noun"
+    }
+  ]
+}
