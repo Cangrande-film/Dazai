@@ -14,6 +14,24 @@ pub enum CheckMode {
     Relaxed,
 }
 
+/// How reviews are spaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Scheduler {
+    /// Bunpro-style: fixed SRS stages measured in hours, due on the hour.
+    #[default]
+    Bunpro,
+    /// Anki-style: learning steps in minutes, ease-based day intervals.
+    Anki,
+}
+
+/// Bunpro's default stage intervals, in hours: 4h 8h 1d 2d 4d 8d 2w 1mo 2mo 4mo 6mo 1y.
+pub const DEFAULT_STAGE_HOURS: [f64; 12] =
+    [4.0, 8.0, 24.0, 48.0, 96.0, 192.0, 336.0, 720.0, 1440.0, 2880.0, 4320.0, 8760.0];
+
+/// Bunpro's names for stage groups: (name, first stage, last stage).
+pub const STAGE_GROUPS: [(&str, u32, u32); 5] =
+    [("Beginner", 1, 3), ("Adept", 4, 6), ("Seasoned", 7, 9), ("Expert", 10, 11), ("Mastered", 12, u32::MAX)];
+
 /// Order in which new cards come out of the word bank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum NewOrder {
@@ -26,6 +44,9 @@ pub enum NewOrder {
 #[serde(default)]
 pub struct Settings {
     pub check_mode: CheckMode,
+    pub scheduler: Scheduler,
+    /// Bunpro-style: interval of each SRS stage, in hours (stage 1 first).
+    pub stage_hours: Vec<f64>,
     /// Minutes between steps while a card is new.
     pub learning_steps: Vec<f64>,
     /// Minutes between steps after forgetting a review card.
@@ -59,6 +80,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             check_mode: CheckMode::Relaxed,
+            scheduler: Scheduler::Bunpro,
+            stage_hours: DEFAULT_STAGE_HOURS.to_vec(),
             learning_steps: vec![1.0, 10.0],
             relearning_steps: vec![10.0],
             graduating_interval: 1,
@@ -100,6 +123,10 @@ pub struct CardState {
     pub due: i64,
     pub reps: u32,
     pub lapses: u32,
+    /// Bunpro-style SRS stage (0 = not started). Cards from the Anki scheduler get one derived
+    /// from their interval the first time they're scheduled.
+    #[serde(default)]
+    pub stage: u32,
 }
 
 impl CardState {
@@ -112,6 +139,7 @@ impl CardState {
             due: 0,
             reps: 0,
             lapses: 0,
+            stage: 0,
         }
     }
 }
@@ -130,7 +158,61 @@ fn days(d: f64) -> i64 {
     (d * DAY as f64).round() as i64
 }
 
+/// Rounds a timestamp up to the next full hour, so reviews arrive in hourly batches.
+pub fn ceil_hour(t: i64) -> i64 {
+    (t + 3599).div_euclid(3600) * 3600
+}
+
+fn stage_hours(s: &Settings) -> &[f64] {
+    if s.stage_hours.is_empty() {
+        &DEFAULT_STAGE_HOURS
+    } else {
+        &s.stage_hours
+    }
+}
+
+/// The card's Bunpro stage; for cards scheduled the Anki way, the highest stage whose
+/// interval fits in the card's current interval.
+pub fn stage_of(state: &CardState, s: &Settings) -> u32 {
+    if state.stage > 0 || state.phase == Phase::New {
+        return state.stage;
+    }
+    let hours = state.interval * 24.0;
+    let fit = stage_hours(s).iter().take_while(|h| **h <= hours.max(1.0)).count() as u32;
+    fit.max(1)
+}
+
+/// Stages lost on a wrong answer: one, or two once a word has reached stage 7 (2 weeks).
+fn stages_dropped(stage: u32) -> u32 {
+    if stage >= 7 { 2 } else { 1 }
+}
+
+fn bunpro_schedule(state: &CardState, grade: Grade, s: &Settings, now: i64) -> CardState {
+    let mut n = state.clone();
+    n.reps += 1;
+    let hours = stage_hours(s);
+    let top = hours.len() as u32;
+    let cur = stage_of(state, s);
+    n.stage = match grade {
+        Grade::Good => (cur + 1).min(top),
+        Grade::Again if cur == 0 => 1,
+        Grade::Again => {
+            n.lapses += 1;
+            cur.saturating_sub(stages_dropped(cur)).max(1)
+        }
+    };
+    let h = hours[(n.stage - 1) as usize];
+    n.phase = Phase::Review;
+    n.step = 0;
+    n.interval = h / 24.0;
+    n.due = ceil_hour(now + (h * 3600.0).round() as i64);
+    n
+}
+
 pub fn schedule(state: &CardState, grade: Grade, s: &Settings, now: i64) -> CardState {
+    if s.scheduler == Scheduler::Bunpro {
+        return bunpro_schedule(state, grade, s, now);
+    }
     let mut n = state.clone();
     n.reps += 1;
 
@@ -226,8 +308,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn learning_flow() {
+    fn bunpro_flow() {
         let s = Settings::default();
+        let now = 1_700_000_000; // not on the hour
+        let c = schedule(&CardState::new(&s), Grade::Good, &s, now);
+        assert_eq!(c.stage, 1);
+        assert_eq!(c.due % 3600, 0, "due on the hour");
+        assert!(c.due >= now + 4 * 3600 && c.due < now + 5 * 3600);
+        let mut c = c;
+        for _ in 0..7 {
+            c = schedule(&c, Grade::Good, &s, now);
+        }
+        assert_eq!(c.stage, 8); // 1 month
+        let miss = schedule(&c, Grade::Again, &s, now);
+        assert_eq!(miss.stage, 6); // drops two from stage 7 up
+        let low = schedule(&schedule(&CardState::new(&s), Grade::Good, &s, now), Grade::Again, &s, now);
+        assert_eq!(low.stage, 1); // never below stage 1
+        // Cards scheduled the Anki way get a stage from their interval: 60 days -> stage 9 (2 months).
+        let mut anki = CardState::new(&s);
+        anki.phase = Phase::Review;
+        anki.interval = 60.0;
+        assert_eq!(stage_of(&anki, &s), 9);
+    }
+
+    #[test]
+    fn learning_flow() {
+        let s = Settings { scheduler: Scheduler::Anki, ..Settings::default() };
         let c = CardState::new(&s);
         let c1 = schedule(&c, Grade::Good, &s, 0);
         assert_eq!(c1.phase, Phase::Learning);

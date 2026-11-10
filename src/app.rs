@@ -5,7 +5,7 @@ use crate::extract::{self, Found, Token};
 use crate::levels::{Jlpt, LEVELS};
 use crate::graph::{self, Graph, GraphWord};
 use crate::pitch;
-use crate::srs::{self, CardState, CheckMode, Grade, NewOrder, Phase, Settings};
+use crate::srs::{self, CardState, CheckMode, Grade, NewOrder, Phase, Scheduler, Settings};
 use crate::storage::{self, Card, ReviewLog, SaveData};
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use eframe::egui::{self, Color32, FontFamily, FontId, Key, RichText};
@@ -72,7 +72,13 @@ enum Msg {
 /// What the current study session draws from.
 enum Session {
     /// Due reviews and learning cards, plus these new cards (indexes into `cards`).
-    Srs { new_queue: VecDeque<usize> },
+    Srs {
+        new_queue: VecDeque<usize>,
+        /// Bunpro-style: missed words come back this session until answered right.
+        retry: VecDeque<usize>,
+        /// The card on screen came from `retry` (answering it doesn't reschedule).
+        retrying: bool,
+    },
     /// Casual review of passed cards; nothing is scheduled.
     Casual { queue: VecDeque<usize>, total: usize, right: usize, answered: usize },
 }
@@ -146,6 +152,7 @@ struct SettingsDraft {
     settings: Settings,
     learning_steps: String,
     relearning_steps: String,
+    stage_hours: String,
     ease_pct: u32,
     modifier_pct: u32,
     lapse_pct: u32,
@@ -158,6 +165,7 @@ impl SettingsDraft {
         Self {
             settings: s.clone(),
             learning_steps: steps_to_string(&s.learning_steps),
+            stage_hours: steps_to_string(&s.stage_hours),
             relearning_steps: steps_to_string(&s.relearning_steps),
             ease_pct: (s.starting_ease * 100.0).round() as u32,
             modifier_pct: (s.interval_modifier * 100.0).round() as u32,
@@ -169,6 +177,11 @@ impl SettingsDraft {
 
     fn build(&self) -> Result<Settings, String> {
         let mut s = self.settings.clone();
+        s.stage_hours = parse_steps(&self.stage_hours)
+            .map_err(|e| format!("Stage intervals: {}", e.replace("minutes", "hours")))?;
+        if s.stage_hours.is_empty() {
+            return Err("Stage intervals: give at least one interval.".into());
+        }
         s.learning_steps = parse_steps(&self.learning_steps).map_err(|e| format!("Learning steps: {e}"))?;
         s.relearning_steps =
             parse_steps(&self.relearning_steps).map_err(|e| format!("Relearning steps: {e}"))?;
@@ -191,6 +204,16 @@ fn parse_steps(text: &str) -> Result<Vec<f64>, String> {
             _ => Err(format!("\"{t}\" is not a positive number of minutes")),
         })
         .collect()
+}
+
+/// "15:00", or "Tue 15:00" when it isn't today.
+fn clock(t: i64) -> String {
+    let Some(dt) = Local.timestamp_opt(t, 0).single() else { return String::new() };
+    if dt.date_naive() == Local::now().date_naive() {
+        dt.format("%H:%M").to_string()
+    } else {
+        dt.format("%a %H:%M").to_string()
+    }
 }
 
 /// Sentence with `word` (or, for conjugated words, its longest leading part) highlighted.
@@ -318,6 +341,19 @@ impl DazaiApp {
             rng: (Local::now().timestamp_nanos_opt().unwrap_or(1) as u64) | 1,
         };
         app.init_known_cards();
+        // Bunpro-style reviews arrive on the hour; align due times saved by older versions.
+        if app.bunpro() {
+            let mut changed = false;
+            for st in app.data.states.values_mut() {
+                if st.phase != Phase::New && st.due % 3600 != 0 {
+                    st.due = srs::ceil_hour(st.due);
+                    changed = true;
+                }
+            }
+            if changed {
+                app.save();
+            }
+        }
         app.bank_count = app.new_left_today().min(app.bank_size() as u32);
         app.spawn(|| Msg::Pitch(dict::load_pitch_db()));
         app
@@ -339,7 +375,7 @@ impl DazaiApp {
             st.phase = Phase::Review;
             st.interval = interval as f64;
             st.reps = 3;
-            st.due = now + due_days * 86_400;
+            st.due = srs::ceil_hour(now + due_days * 86_400);
             self.data.states.insert(c.id.clone(), st);
             added = true;
         }
@@ -598,10 +634,45 @@ impl DazaiApp {
         (0..self.cards.len()).filter(|&i| self.state(i).phase == Phase::Review).collect()
     }
 
+    fn bunpro(&self) -> bool {
+        self.data.settings.scheduler == Scheduler::Bunpro
+    }
+
+    /// Reviews due at or before this time are shown now: the current moment for Bunpro-style
+    /// hourly reviews, the end of the study day for Anki-style.
+    fn due_cutoff(&self) -> i64 {
+        if self.bunpro() {
+            Self::now()
+        } else {
+            Self::study_day().1
+        }
+    }
+
+    /// Bunpro-style: the next hourly batch after now, as (time, card count).
+    fn next_batch(&self) -> Option<(i64, usize)> {
+        let now = Self::now();
+        let hours: Vec<i64> = (0..self.cards.len())
+            .map(|i| self.state(i))
+            .filter(|s| s.phase != Phase::New && s.due > now)
+            .map(|s| srs::ceil_hour(s.due))
+            .collect();
+        let first = *hours.iter().min()?;
+        Some((first, hours.iter().filter(|h| **h == first).count()))
+    }
+
+    /// Reviews coming due within the next `secs` seconds.
+    fn due_within(&self, secs: i64) -> usize {
+        let now = Self::now();
+        (0..self.cards.len())
+            .map(|i| self.state(i))
+            .filter(|s| s.phase != Phase::New && s.due > now && s.due <= now + secs)
+            .count()
+    }
+
     /// (new, learning, review) counts for the top bar.
     fn counts(&self) -> (usize, usize, usize) {
         let now = Self::now();
-        let (_, day_end) = Self::study_day();
+        let day_end = self.due_cutoff();
         let ahead = now + self.data.settings.learn_ahead_minutes as i64 * 60;
         let (mut learn, mut review) = (0, 0);
         for idx in 0..self.cards.len() {
@@ -613,8 +684,8 @@ impl DazaiApp {
             }
         }
         let new = match &self.session {
-            Some(Session::Srs { new_queue }) => {
-                new_queue.iter().filter(|&&i| self.state(i).phase == Phase::New).count()
+            Some(Session::Srs { new_queue, retry, .. }) => {
+                new_queue.iter().filter(|&&i| self.state(i).phase == Phase::New).count() + retry.len()
             }
             _ => 0,
         };
@@ -623,13 +694,14 @@ impl DazaiApp {
 
     fn pick_next(&mut self) -> Option<usize> {
         let now = Self::now();
-        let (_, day_end) = Self::study_day();
+        let day_end = self.due_cutoff();
         let ahead = now + self.data.settings.learn_ahead_minutes as i64 * 60;
         let states: Vec<CardState> = (0..self.cards.len()).map(|i| self.state(i)).collect();
         match &mut self.session {
             None => None,
             Some(Session::Casual { queue, .. }) => queue.pop_front(),
-            Some(Session::Srs { new_queue }) => {
+            Some(Session::Srs { new_queue, retry, retrying }) => {
+                *retrying = false;
                 let earliest = |pred: &dyn Fn(&CardState) -> bool| {
                     states
                         .iter()
@@ -642,10 +714,17 @@ impl DazaiApp {
                 while new_queue.front().is_some_and(|&i| states[i].phase != Phase::New) {
                     new_queue.pop_front();
                 }
-                earliest(&|s| learning(s) && s.due <= now)
+                let next = earliest(&|s| learning(s) && s.due <= now)
                     .or_else(|| earliest(&|s| s.phase == Phase::Review && s.due <= day_end))
-                    .or_else(|| new_queue.front().copied())
-                    .or_else(|| earliest(&|s| learning(s) && s.due <= ahead))
+                    .or_else(|| new_queue.front().copied());
+                if next.is_some() {
+                    return next;
+                }
+                if let Some(i) = retry.pop_front() {
+                    *retrying = true;
+                    return Some(i);
+                }
+                earliest(&|s| learning(s) && s.due <= ahead)
             }
         }
     }
@@ -666,7 +745,7 @@ impl DazaiApp {
         prio.extend(rest);
         prio.truncate(new);
         self.session_label = if prio.is_empty() { "Reviews".into() } else { format!("Reviews + {} new", prio.len()) };
-        self.session = Some(Session::Srs { new_queue: prio.into() });
+        self.session = Some(Session::Srs { new_queue: prio.into(), retry: VecDeque::new(), retrying: false });
         self.save();
         self.study = Study::Pick;
     }
@@ -734,7 +813,7 @@ impl DazaiApp {
         }
         self.shuffle(&mut idxs);
         self.session_label = format!("Reviews + {} generated", idxs.len());
-        self.session = Some(Session::Srs { new_queue: idxs.into() });
+        self.session = Some(Session::Srs { new_queue: idxs.into(), retry: VecDeque::new(), retrying: false });
         self.gen.status.clear();
         if self.screen == Screen::Study {
             self.study = Study::Pick;
@@ -794,25 +873,40 @@ impl DazaiApp {
         }
         let verdict = check::check(&typed, &self.cards[idx].readings, self.data.settings.check_mode);
         if verdict == Verdict::Wrong {
-            if self.is_casual() {
-                self.casual_answer(idx, false);
-            } else {
-                self.answer(idx, Grade::Again);
-            }
+            self.grade(idx, false);
         }
         self.study = Study::Revealed { idx, typed, verdict };
         self.on_reveal(idx);
+    }
+
+    fn is_retry(&self) -> bool {
+        matches!(self.session, Some(Session::Srs { retrying: true, .. }))
+    }
+
+    /// Records an answer. Random study never schedules; Bunpro-style sessions bring missed words
+    /// back until they're answered right, and only the first answer moves the SRS stage.
+    fn grade(&mut self, idx: usize, good: bool) {
+        if self.is_casual() {
+            self.casual_answer(idx, good);
+            return;
+        }
+        let bunpro = self.bunpro();
+        let retrying = self.is_retry();
+        if !(bunpro && retrying) {
+            self.answer(idx, if good { Grade::Good } else { Grade::Again });
+        }
+        if bunpro && !good {
+            if let Some(Session::Srs { retry, .. }) = &mut self.session {
+                retry.push_back(idx);
+            }
+        }
     }
 
     /// Esc while answering: show the answer, counted as wrong.
     fn give_up(&mut self) {
         let Study::Asking { idx, .. } = &self.study else { return };
         let idx = *idx;
-        if self.is_casual() {
-            self.casual_answer(idx, false);
-        } else {
-            self.answer(idx, Grade::Again);
-        }
+        self.grade(idx, false);
         self.study = Study::Revealed { idx, typed: String::new(), verdict: Verdict::Wrong };
         self.on_reveal(idx);
     }
@@ -1021,6 +1115,13 @@ impl DazaiApp {
                         Some(Session::Casual { total, right, answered, .. }) => format!(
                             "Random study done: {total} words, {right} of {answered} answers right. Scheduling wasn't changed."
                         ),
+                        _ if self.bunpro() => match self.next_batch() {
+                            Some((t, n)) => format!(
+                                "Session done. Next reviews: {n} at {}.",
+                                clock(t)
+                            ),
+                            None => "Session done. Nothing else is due.".to_string(),
+                        },
                         _ => match self.next_due_in() {
                             Some(s) if s < 3600 => format!("Session done. A learning card comes back in {}.", srs::format_secs(s)),
                             _ => "Session done. Nothing else is due.".to_string(),
@@ -1133,10 +1234,21 @@ impl DazaiApp {
                     ui.set_width(width);
                     ui.add_space(16.0);
                     ui.label(RichText::new("今日の勉強").font(display_font(34.0)));
-                    ui.label(
-                        RichText::new(format!("{review} reviews due · {learn} learning · {} words in the bank", bank.len()))
-                            .color(MUTED),
-                    );
+                    let header = if self.bunpro() {
+                        let next = match self.next_batch() {
+                            Some((t, n)) => format!(" · next: {n} at {}", clock(t)),
+                            None => String::new(),
+                        };
+                        format!(
+                            "{} reviews due{next} · {} in the next 24h · {} words in the bank",
+                            review + learn,
+                            self.due_within(86_400),
+                            bank.len()
+                        )
+                    } else {
+                        format!("{review} reviews due · {learn} learning · {} words in the bank", bank.len())
+                    };
+                    ui.label(RichText::new(header).color(MUTED));
                     ui.add_space(14.0);
 
                     let card_frame = || {
@@ -1315,7 +1427,11 @@ impl DazaiApp {
 
         if verdict == Verdict::Wrong {
             let cont = ui.add(egui::Button::new("Continue").min_size(egui::vec2(140.0, 36.0)));
-            let note = if casual { "you'll see it again this session · Enter" } else { "marked wrong · Enter" };
+            let note = if casual || self.bunpro() {
+                "you'll see it again this session · Enter"
+            } else {
+                "marked wrong · Enter"
+            };
             ui.label(RichText::new(note).small().color(MUTED));
             if cont.clicked() || enter || space {
                 self.study = Study::Pick;
@@ -1325,6 +1441,8 @@ impl DazaiApp {
 
         let (again_lbl, good_lbl) = if casual {
             ("Missed it".to_string(), "Got it".to_string())
+        } else if self.is_retry() {
+            ("Again  · retry".to_string(), "Good  · cleared".to_string())
         } else {
             let state = self.state(idx);
             let s = &self.data.settings;
@@ -1359,11 +1477,7 @@ impl DazaiApp {
             grade = Some(Grade::Good);
         }
         if let Some(g) = grade {
-            if casual {
-                self.casual_answer(idx, g == Grade::Good);
-            } else {
-                self.answer(idx, g);
-            }
+            self.grade(idx, g == Grade::Good);
             self.study = Study::Pick;
         }
     }
@@ -2192,13 +2306,66 @@ impl DazaiApp {
             let young = states.iter().filter(|s| s.phase == Phase::Review && s.interval < 21.0).count();
             let mature = states.iter().filter(|s| s.phase == Phase::Review && s.interval >= 21.0).count();
             section(ui, "Cards");
-            let parts = [
-                (new, "new", MUTED),
-                (learning, "learning", RED),
-                (young, "young (< 21d)", Color32::from_rgb(160, 200, 130)),
-                (mature, "mature", Color32::from_rgb(90, 140, 80)),
-            ];
-            stacked_bar(ui, &parts);
+            if self.bunpro() {
+                // Bunpro's stage groups: Beginner … Mastered.
+                let shades = [
+                    Color32::from_rgb(200, 120, 90),
+                    Color32::from_rgb(210, 170, 90),
+                    Color32::from_rgb(160, 200, 130),
+                    Color32::from_rgb(110, 160, 90),
+                    Color32::from_rgb(110, 150, 200),
+                ];
+                let settings = &self.data.settings;
+                let mut parts: Vec<(usize, &str, Color32)> = vec![(new, "new", MUTED)];
+                for (g, (name, lo, hi)) in srs::STAGE_GROUPS.iter().enumerate() {
+                    let n = states
+                        .iter()
+                        .filter(|s| s.phase != Phase::New)
+                        .filter(|s| (*lo..=*hi).contains(&srs::stage_of(s, settings).max(1)))
+                        .count();
+                    parts.push((n, name, shades[g]));
+                }
+                stacked_bar(ui, &parts);
+                ui.label(
+                    RichText::new("Beginner 4h–1d · Adept 2–8d · Seasoned 2w–2mo · Expert 4–6mo · Mastered 1y")
+                        .small()
+                        .color(MUTED),
+                );
+            } else {
+                let parts = [
+                    (new, "new", MUTED),
+                    (learning, "learning", RED),
+                    (young, "young (< 21d)", Color32::from_rgb(160, 200, 130)),
+                    (mature, "mature", Color32::from_rgb(90, 140, 80)),
+                ];
+                stacked_bar(ui, &parts);
+            }
+            ui.add_space(14.0);
+
+            // Hourly forecast: what's due now, then each of the next 24 hourly batches.
+            section(ui, "Next 24 hours");
+            let base = srs::ceil_hour(now);
+            let mut hourly = vec![0f32; 25];
+            for s in states.iter().filter(|s| s.phase != Phase::New) {
+                if s.due <= now {
+                    hourly[0] += 1.0;
+                } else {
+                    let k = ((srs::ceil_hour(s.due) - base) / 3600 + 1) as usize;
+                    if k < 25 {
+                        hourly[k] += 1.0;
+                    }
+                }
+            }
+            let tips: Vec<String> = (0..25)
+                .map(|k| {
+                    if k == 0 {
+                        format!("due now: {}", hourly[0])
+                    } else {
+                        format!("{}: {} cards", clock(base + (k as i64 - 1) * 3600), hourly[k])
+                    }
+                })
+                .collect();
+            bar_chart(ui, &hourly.iter().map(|&v| (v, 0.0)).collect::<Vec<_>>(), &tips, AMBER, "now", "+24h");
             ui.add_space(14.0);
 
             // Forecast
@@ -2354,6 +2521,31 @@ impl DazaiApp {
             ui.add_space(16.0);
 
             ui.label(RichText::new("Spacing").color(MUTED));
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut d.settings.scheduler, Scheduler::Bunpro, "Bunpro-style (hourly SRS stages)");
+                ui.radio_value(&mut d.settings.scheduler, Scheduler::Anki, "Anki-style (days, ease)");
+            });
+            if d.settings.scheduler == Scheduler::Bunpro {
+                egui::Grid::new("stages").num_columns(2).spacing([24.0, 10.0]).show(ui, |ui| {
+                    ui.label("Stage intervals (hours)");
+                    ui.add(egui::TextEdit::singleline(&mut d.stage_hours).desired_width(320.0));
+                    ui.end_row();
+                    ui.label("New cards per day");
+                    ui.add(egui::DragValue::new(&mut d.settings.new_per_day).range(0..=9999));
+                    ui.end_row();
+                });
+                if ui.add(egui::Button::new(RichText::new("Bunpro defaults").small().color(MUTED)).frame(false)).clicked() {
+                    d.stage_hours = steps_to_string(&srs::DEFAULT_STAGE_HOURS);
+                }
+                ui.label(
+                    RichText::new(
+                        "Right answers move a word up one stage, wrong ones down one (two from stage 7). \
+                         Reviews come due on the hour; missed words come back in the same session.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+            } else {
             egui::Grid::new("spacing").num_columns(2).spacing([24.0, 10.0]).show(ui, |ui| {
                 ui.label("Learning steps (minutes)");
                 ui.add(egui::TextEdit::singleline(&mut d.learning_steps).desired_width(120.0));
@@ -2388,6 +2580,7 @@ impl DazaiApp {
                     .small()
                     .color(MUTED),
             );
+            }
 
             if let Some(e) = &d.error {
                 ui.add_space(8.0);
