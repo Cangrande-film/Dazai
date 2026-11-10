@@ -1174,11 +1174,27 @@ impl DazaiApp {
         let n = check::normalize(&typed);
         // The word itself or one of its own spellings (子ども for 子供) is right, Latin letters
         // included (Tシャツ, CD), so check that before the romaji warning.
+        let needs_kanji = card.word.chars().any(dict::is_kanji);
+        let typed_kanji = typed.chars().any(dict::is_kanji);
+        // A word written with kanji must be answered with kanji: its kanji spellings count
+        // (子ども for 子供), its bare kana reading doesn't.
         let own_spelling = check::normalize(&card.word) == n
-            || crate::jmdict::spellings(&card.word).iter().any(|s| check::normalize(s) == n);
+            || crate::jmdict::spellings(&card.word)
+                .iter()
+                .filter(|s| !needs_kanji || s.chars().any(dict::is_kanji))
+                .any(|s| check::normalize(s) == n);
         if !own_spelling && check::looks_like_romaji(&typed) {
             *hint = Some("That's romaji. Switch the keyboard to hiragana (Alt + `).".into());
             return;
+        }
+        // The right reading in kana for a kanji word: not a mistake, just ask for the kanji.
+        if needs_kanji && !typed_kanji && !own_spelling {
+            let right_reading = check::check(&typed, &card.readings, self.data.settings.check_mode) != Verdict::Wrong;
+            if right_reading {
+                *hint = Some("That's the right reading. Now write it with kanji: type it again and convert it (Space).".into());
+                input.clear();
+                return;
+            }
         }
         let mut verdict = if own_spelling {
             Verdict::Correct
@@ -1848,7 +1864,7 @@ impl DazaiApp {
                         Some(h) => ui.label(RichText::new(h.as_str()).color(AMBER)),
                         None => ui.label(
                             RichText::new(if reverse {
-                                "type the Japanese word (kana or kanji), then Enter  ·  Esc if you don't know it"
+                                "type the Japanese word, with its kanji if it has any, then Enter  ·  Esc if you don't know it"
                             } else {
                                 "type the reading, then Enter  ·  Esc if you don't know it"
                             })
