@@ -329,6 +329,49 @@ mod tests {
     }
 }
 
+/// Colours of Bunpro's stage groups: Beginner, Adept, Seasoned, Expert, Mastered.
+const STAGE_SHADES: [Color32; 5] = [
+    Color32::from_rgb(200, 120, 90),
+    Color32::from_rgb(210, 170, 90),
+    Color32::from_rgb(160, 200, 130),
+    Color32::from_rgb(110, 160, 90),
+    Color32::from_rgb(110, 150, 200),
+];
+
+/// Index into STAGE_GROUPS for an SRS stage.
+fn stage_group(stage: u32) -> usize {
+    srs::STAGE_GROUPS.iter().position(|(_, lo, hi)| (*lo..=*hi).contains(&stage.max(1))).unwrap_or(0)
+}
+
+/// A completion bar split by stage group (Beginner … Mastered); the rest is unknown.
+fn stage_progress(ui: &mut egui::Ui, groups: [usize; 5], total: usize, extra: &str) {
+    let known: usize = groups.iter().sum();
+    ui.horizontal(|ui| {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(150.0, 10.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, Color32::from_rgb(34, 34, 34));
+        let mut x = rect.left();
+        for (g, n) in groups.iter().enumerate() {
+            if total == 0 || *n == 0 {
+                continue;
+            }
+            let w = rect.width() * (*n as f32 / total as f32).min(1.0);
+            painter.rect_filled(egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, rect.height())), 0.0, STAGE_SHADES[g]);
+            x += w;
+        }
+        resp.on_hover_ui(|ui| {
+            for (g, (name, ..)) in srs::STAGE_GROUPS.iter().enumerate() {
+                ui.label(RichText::new(format!("{name}: {}", groups[g])).color(STAGE_SHADES[g]));
+            }
+            ui.label(RichText::new(format!("not known yet: {}", total.saturating_sub(known))).color(MUTED));
+        });
+        ui.label(RichText::new(format!("{known} / {total}")).size(14.0));
+        if !extra.is_empty() {
+            ui.label(RichText::new(extra).small().color(MUTED));
+        }
+    });
+}
+
 const WORD_TYPES: [&str; 5] = ["verbs", "adjectives", "nouns", "adverbs", "other"];
 
 /// Rough word type from a card's notes ("N5 · verb (godan)"), as an index into WORD_TYPES.
@@ -3600,13 +3643,7 @@ impl DazaiApp {
             section(ui, "Cards");
             if self.bunpro() {
                 // Bunpro's stage groups: Beginner … Mastered.
-                let shades = [
-                    Color32::from_rgb(200, 120, 90),
-                    Color32::from_rgb(210, 170, 90),
-                    Color32::from_rgb(160, 200, 130),
-                    Color32::from_rgb(110, 160, 90),
-                    Color32::from_rgb(110, 150, 200),
-                ];
+                let shades = STAGE_SHADES;
                 let settings = &self.data.settings;
                 let mut parts: Vec<(usize, &str, Color32)> = vec![(new, "new", MUTED)];
                 for (g, (name, lo, hi)) in srs::STAGE_GROUPS.iter().enumerate() {
@@ -3750,10 +3787,20 @@ impl DazaiApp {
             let mut known_kanji: HashSet<char> = HashSet::new();
             // A word with several cards (日: ひ / にち) counts once: known if any card is passed.
             let mut word_best: HashMap<&str, Phase> = HashMap::new();
+            // Highest stage group per known word, and per kanji (from the words that use it).
+            let mut word_group: HashMap<&str, usize> = HashMap::new();
+            let mut kanji_group: HashMap<char, usize> = HashMap::new();
             for (i, c) in self.cards.iter().enumerate() {
                 let phase = states[i].phase;
                 if phase == Phase::Review {
                     known_kanji.extend(dict::kanji_of(&c.word));
+                    let g = stage_group(srs::stage_of(&states[i], &self.data.settings));
+                    let e = word_group.entry(c.word.as_str()).or_insert(g);
+                    *e = (*e).max(g);
+                    for k in dict::kanji_of(&c.word) {
+                        let e = kanji_group.entry(k).or_insert(g);
+                        *e = (*e).max(g);
+                    }
                 }
                 let rank = |p: Phase| match p {
                     Phase::Review => 2,
@@ -3765,19 +3812,25 @@ impl DazaiApp {
                     *e = phase;
                 }
             }
+            let mut word_groups = [[0usize; 5]; 5]; // [level][stage group]
             for (w, phase) in &word_best {
                 if let Some(&l) = self.jlpt.word_level.get(*w) {
                     match phase {
-                        Phase::Review => words_known[l] += 1,
+                        Phase::Review => {
+                            words_known[l] += 1;
+                            word_groups[l][word_group.get(*w).copied().unwrap_or(0)] += 1;
+                        }
                         Phase::Learning | Phase::Relearning => words_learning[l] += 1,
                         Phase::New => {}
                     }
                 }
             }
             let mut kanji_known = [0usize; 5];
+            let mut kanji_groups = [[0usize; 5]; 5];
             for k in &known_kanji {
                 if let Some(&l) = self.jlpt.kanji_level.get(k) {
                     kanji_known[l] += 1;
+                    kanji_groups[l][kanji_group.get(k).copied().unwrap_or(0)] += 1;
                 }
             }
             egui::Grid::new("jlpt").num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
@@ -3790,18 +3843,35 @@ impl DazaiApp {
                     ui.label(RichText::new(LEVELS[l]).size(16.0).color(BLUE));
                     let learning = if words_learning[l] > 0 { format!("  +{} learning", words_learning[l]) } else { String::new() };
                     let w = format!("{:.0}%{learning}", pct(words_known[l], self.jlpt.word_totals[l]));
-                    progress(ui, words_known[l], self.jlpt.word_totals[l], GREEN, &w);
+                    stage_progress(ui, word_groups[l], self.jlpt.word_totals[l], &w);
                     let k = format!("{:.0}%", pct(kanji_known[l], self.jlpt.kanji_totals[l]));
-                    progress(ui, kanji_known[l], self.jlpt.kanji_totals[l], AMBER, &k);
+                    stage_progress(ui, kanji_groups[l], self.jlpt.kanji_totals[l], &k);
                     ui.end_row();
                 }
                 // Everything the JLPT covers, N5 to N1 together.
                 let (wk, wt): (usize, usize) = (words_known.iter().sum(), self.jlpt.word_totals.iter().sum());
                 let (kk, kt): (usize, usize) = (kanji_known.iter().sum(), self.jlpt.kanji_totals.iter().sum());
                 ui.label(RichText::new("Total").size(16.0).strong());
-                progress(ui, wk, wt, GREEN, &format!("{:.1}% of all JLPT words", pct(wk, wt)));
-                progress(ui, kk, kt, AMBER, &format!("{:.1}% of all JLPT kanji", pct(kk, kt)));
+                let sum = |rows: &[[usize; 5]; 5]| {
+                    let mut t = [0usize; 5];
+                    for r in rows {
+                        for (g, n) in r.iter().enumerate() {
+                            t[g] += n;
+                        }
+                    }
+                    t
+                };
+                stage_progress(ui, sum(&word_groups), wt, &format!("{:.1}% of all JLPT words", pct(wk, wt)));
+                stage_progress(ui, sum(&kanji_groups), kt, &format!("{:.1}% of all JLPT kanji", pct(kk, kt)));
                 ui.end_row();
+            });
+            ui.horizontal_wrapped(|ui| {
+                for (g, (name, ..)) in srs::STAGE_GROUPS.iter().enumerate() {
+                    ui.label(RichText::new("■").color(STAGE_SHADES[g]));
+                    ui.label(RichText::new(*name).small().color(MUTED));
+                    ui.add_space(6.0);
+                }
+                ui.label(RichText::new("· hover a bar for the counts; a kanji counts at its best word's stage").small().color(MUTED));
             });
             ui.label(
                 RichText::new(format!(
