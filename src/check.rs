@@ -27,35 +27,58 @@ fn kata_to_hira(c: char) -> char {
     }
 }
 
-/// Folds the differences relaxed mode forgives outright: small vs. big kana, long-vowel marks.
-fn fold(c: char) -> Option<char> {
+/// Small kana written big; voiced/half-voiced kana written plain; kana that sound the same
+/// merged. Long marks and small っ are dropped. Applied to hiragana.
+fn plain(c: char) -> Option<char> {
+    const VOICED: &str = "がぎぐげござじずぜぞだぢづでどばびぶべぼぱぴぷぺぽゔ";
+    const PLAIN: &str = "かきくけこさしすせそたしすてとはひふへほはひふへほう";
     Some(match c {
         'ぁ' => 'あ',
         'ぃ' => 'い',
         'ぅ' => 'う',
         'ぇ' => 'え',
         'ぉ' => 'お',
-        'っ' => 'つ',
         'ゃ' => 'や',
         'ゅ' => 'ゆ',
         'ょ' => 'よ',
         'ゎ' => 'わ',
-        'ー' | '〜' | '~' => return None,
-        c => c,
+        'を' => 'お',
+        'っ' | 'ー' | '〜' | '~' => return None,
+        c => match VOICED.chars().position(|v| v == c) {
+            Some(i) => PLAIN.chars().nth(i).unwrap_or(c),
+            None => c,
+        },
     })
 }
 
-fn levenshtein(a: &[char], b: &[char]) -> usize {
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1; b.len() + 1];
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+/// The vowel a (plain) kana ends in.
+fn vowel(c: char) -> Option<char> {
+    const ROWS: [(char, &str); 5] = [
+        ('あ', "あかさたなはまやらわ"),
+        ('い', "いきしちにひみり"),
+        ('う', "うくすつぬふむゆる"),
+        ('え', "えけせてねへめれ"),
+        ('お', "おこそとのほもよろ"),
+    ];
+    ROWS.iter().find(|(_, row)| row.contains(c)).map(|(v, _)| *v)
+}
+
+/// How a reading sounds to an English speaker's ear, roughly: voicing, long vowels, っ and
+/// small kana don't matter; every other sound does. がっこう → かこ, がくせい → かくせ.
+fn sound(s: &str) -> Vec<char> {
+    let mut out: Vec<char> = Vec::new();
+    for c in s.chars().map(kata_to_hira).filter_map(plain) {
+        // A vowel that only lengthens the previous one (こう, せい, ああ…) is dropped.
+        if let (Some(&prev), Some(v)) = (out.last(), "あいうえお".contains(c).then_some(c)) {
+            let pv = vowel(prev);
+            let lengthens = pv == Some(v) || (pv == Some('お') && v == 'う') || (pv == Some('え') && v == 'い');
+            if lengthens {
+                continue;
+            }
         }
-        prev = cur;
+        out.push(c);
     }
-    prev[b.len()]
+    out
 }
 
 /// True when the input looks like romaji (the IME was off).
@@ -76,8 +99,7 @@ pub fn check(input: &str, readings: &[String], mode: CheckMode) -> Verdict {
     }
 
     let hira: Vec<char> = typed.chars().map(kata_to_hira).collect();
-    let folded: Vec<char> = hira.iter().copied().filter_map(fold).collect();
-
+    let typed_sound = sound(&typed);
     let mut best = Verdict::Wrong;
     for r in readings {
         let rh: Vec<char> = clean(r).chars().map(kata_to_hira).collect();
@@ -85,18 +107,9 @@ pub fn check(input: &str, readings: &[String], mode: CheckMode) -> Verdict {
             // Typed in katakana: fully correct in relaxed mode.
             return Verdict::Correct;
         }
-        let rf: Vec<char> = rh.iter().copied().filter_map(fold).collect();
-        if rf == folded {
-            best = Verdict::Close;
-            continue;
-        }
-        // Allow one slip in words of 3+ kana, two in long words.
-        let allowed = match rh.len() {
-            0..=2 => 0,
-            3..=6 => 1,
-            _ => 2,
-        };
-        if allowed > 0 && levenshtein(&folded, &rf) <= allowed {
+        // Only slips that sound alike pass: voicing (か/が), long vowels, っ, small kana.
+        // A different sound anywhere (a different kanji reading) is a mistake.
+        if !typed_sound.is_empty() && sound(r) == typed_sound {
             best = Verdict::Close;
         }
     }
@@ -124,12 +137,26 @@ mod tests {
     fn relaxed() {
         let rs = r(&["がっこう"]);
         assert_eq!(check("ガッコウ", &rs, CheckMode::Relaxed), Verdict::Correct);
-        assert_eq!(check("がつこう", &rs, CheckMode::Relaxed), Verdict::Close);
+        // Sound-alike slips: っ, long vowel, voicing.
         assert_eq!(check("がこう", &rs, CheckMode::Relaxed), Verdict::Close);
         assert_eq!(check("がっこ", &rs, CheckMode::Relaxed), Verdict::Close);
-        assert_eq!(check("かっこ", &rs, CheckMode::Relaxed), Verdict::Wrong);
-        // Short words get no typo allowance.
+        assert_eq!(check("かっこう", &rs, CheckMode::Relaxed), Verdict::Close);
+        assert_eq!(check("がつこう", &rs, CheckMode::Relaxed), Verdict::Wrong); // つ is a sound, not っ
+        // A different sound is a different reading: wrong.
+        assert_eq!(check("がっせい", &rs, CheckMode::Relaxed), Verdict::Wrong);
+        assert_eq!(check("がっこく", &rs, CheckMode::Relaxed), Verdict::Wrong);
+        let gakusei = r(&["がくせい"]);
+        assert_eq!(check("がくせ", &gakusei, CheckMode::Relaxed), Verdict::Close);
+        assert_eq!(check("がくしぇい", &gakusei, CheckMode::Relaxed), Verdict::Wrong);
+        let kyaku = r(&["きゃく"]);
+        assert_eq!(check("きやく", &kyaku, CheckMode::Relaxed), Verdict::Close);
         let neko = r(&["ねこ"]);
-        assert_eq!(check("ねご", &neko, CheckMode::Relaxed), Verdict::Wrong);
+        assert_eq!(check("ねご", &neko, CheckMode::Relaxed), Verdict::Close);
+        assert_eq!(check("ねむ", &neko, CheckMode::Relaxed), Verdict::Wrong);
+        let tokei = r(&["とけい"]);
+        assert_eq!(check("とけ", &tokei, CheckMode::Relaxed), Verdict::Close);
+        assert_eq!(check("とかい", &tokei, CheckMode::Relaxed), Verdict::Wrong);
+        let hanaji = r(&["はなぢ"]);
+        assert_eq!(check("はなじ", &hanaji, CheckMode::Relaxed), Verdict::Close);
     }
 }
