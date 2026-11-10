@@ -2185,7 +2185,6 @@ impl DazaiApp {
                                     let st = &mut self.data.settings;
                                     if timed {
                                         ui.add(egui::DragValue::new(&mut st.casual_minutes).range(1..=60));
-                                        ui.label(RichText::new(format!("from {passed} passed")).color(MUTED));
                                     } else {
                                         st.casual_count = st.casual_count.clamp(1, passed.max(1) as u32);
                                         ui.add(egui::DragValue::new(&mut st.casual_count).range(1..=passed.max(1) as u32));
