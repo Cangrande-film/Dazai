@@ -3506,13 +3506,23 @@ impl DazaiApp {
                 ui.label(RichText::new("words").small().color(MUTED));
                 ui.label(RichText::new("kanji").small().color(MUTED));
                 ui.end_row();
+                let pct = |n: usize, d: usize| if d == 0 { 0.0 } else { n as f64 * 100.0 / d as f64 };
                 for l in 0..5 {
                     ui.label(RichText::new(LEVELS[l]).size(16.0).color(BLUE));
-                    let extra = if words_learning[l] > 0 { format!("  +{} learning", words_learning[l]) } else { String::new() };
-                    progress(ui, words_known[l], self.jlpt.word_totals[l], GREEN, &extra);
-                    progress(ui, kanji_known[l], self.jlpt.kanji_totals[l], AMBER, "");
+                    let learning = if words_learning[l] > 0 { format!("  +{} learning", words_learning[l]) } else { String::new() };
+                    let w = format!("{:.0}%{learning}", pct(words_known[l], self.jlpt.word_totals[l]));
+                    progress(ui, words_known[l], self.jlpt.word_totals[l], GREEN, &w);
+                    let k = format!("{:.0}%", pct(kanji_known[l], self.jlpt.kanji_totals[l]));
+                    progress(ui, kanji_known[l], self.jlpt.kanji_totals[l], AMBER, &k);
                     ui.end_row();
                 }
+                // Everything the JLPT covers, N5 to N1 together.
+                let (wk, wt): (usize, usize) = (words_known.iter().sum(), self.jlpt.word_totals.iter().sum());
+                let (kk, kt): (usize, usize) = (kanji_known.iter().sum(), self.jlpt.kanji_totals.iter().sum());
+                ui.label(RichText::new("Total").size(16.0).strong());
+                progress(ui, wk, wt, GREEN, &format!("{:.1}% of all JLPT words", pct(wk, wt)));
+                progress(ui, kk, kt, AMBER, &format!("{:.1}% of all JLPT kanji", pct(kk, kt)));
+                ui.end_row();
             });
             ui.label(
                 RichText::new(format!(
