@@ -61,10 +61,10 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 
 ## Behaviour worth knowing
 
-- **Study menu**: (1) "Study session": choose how many due reviews to do (all by default,
+- **Study menu** (two columns; window 1040×740 by default): (1) "Learning session": choose how many due reviews to do (all by default,
   ghosts included; `Session::Srs.reviews_left`), plus optional new words from the word bank (as
   added or random; priority first) or generated (N words from the frequency list, K sharing a
-  known kanji, confirmed on Jisho). (2) Random study of passed cards, filterable by JLPT level /
+  known kanji, confirmed on Jisho). (2) "Drilling session" (random study) of passed cards, filterable by JLPT level /
   "other": a set number of words, or timed (1–60 min, `Session::Casual.deadline`; misses don't come back
   during the run, the end screen offers to review them untimed). Casual sessions never change
   stages but do feed ghosts, and end with a stats summary. (3) Leeches.
@@ -81,7 +81,8 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 - **Conjugate tab**: drill like wkdonc.github.io/conjugation/drill.html, built only from passed
   words: given form → target form, typed in kanji or kana, no effect on scheduling.
 - **English → Japanese**: `choose_reverse` asks a review the other way (meaning shown, type the
-  word in kana or kanji) for `reverse_percent` (default 30%) of words at `reverse_min_stage`
+  word in kana or kanji) for `reverse_percent` (learning) / `drill_reverse_percent` (drilling),
+  sliders on the Study page (default 30%), of words at `reverse_min_stage`
   (default 5) or higher. Decided once per card per session (`directions`), replacing the normal
   question, so no extra reviews. A wrong answer that's a JMdict word sharing a gloss
   (`shares_gloss`) gets a "different word, try again" hint instead of a miss.

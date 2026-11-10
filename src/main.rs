@@ -21,8 +21,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Dazai")
-            .with_inner_size([760.0, 660.0])
-            .with_min_inner_size([420.0, 480.0]),
+            .with_inner_size([1040.0, 740.0])
+            .with_min_inner_size([760.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native(

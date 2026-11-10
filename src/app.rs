@@ -994,7 +994,7 @@ impl DazaiApp {
         self.shuffle(&mut passed);
         passed.truncate(n);
         let total = passed.len();
-        self.session_label = format!("Random study · {total} words");
+        self.session_label = format!("Drilling · {total} words");
         self.session = Some(Session::Casual {
             queue: passed.into(),
             right: 0,
@@ -1012,7 +1012,7 @@ impl DazaiApp {
         let mut pool = self.casual_pool();
         self.shuffle(&mut pool);
         let minutes = minutes.clamp(1, 60);
-        self.session_label = format!("Timed random study · {minutes} min");
+        self.session_label = format!("Timed drilling · {minutes} min");
         self.session = Some(Session::Casual {
             queue: pool.into(),
             right: 0,
@@ -1137,11 +1137,12 @@ impl DazaiApp {
         }
         let s = &self.data.settings;
         let st = self.state(idx);
-        let eligible = s.reverse_percent > 0
+        let share = if matches!(self.session, Some(Session::Casual { .. })) { s.drill_reverse_percent } else { s.reverse_percent };
+        let eligible = share > 0
             && st.phase == Phase::Review
             && srs::stage_of(&st, s) >= s.reverse_min_stage
             && !self.cards[idx].meaning.trim().is_empty();
-        let percent = s.reverse_percent.min(100) as u64;
+        let percent = share.min(100) as u64;
         let d = eligible && self.rand() % 100 < percent;
         self.directions.insert(idx, d);
         d
@@ -1869,8 +1870,10 @@ impl DazaiApp {
             level_counts[self.card_level(i)] += 1;
         }
         let passed: usize = (0..6).filter(|&l| self.data.settings.casual_levels[l]).map(|l| level_counts[l]).sum();
-        let width = ui.available_width().min(560.0);
+        let width = ui.available_width().min(1000.0);
         let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+        let gap = 14.0;
+        let col_w = ((width - gap) / 2.0).floor();
 
         egui::ScrollArea::vertical().id_salt("menu").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1905,15 +1908,22 @@ impl DazaiApp {
                             .inner_margin(egui::Margin::symmetric(16, 14))
                     };
 
-                    // 1. Study session: reviews, plus optional new words (word bank or generated)
+                    // Learning (left) and drilling (right), side by side.
                     let due = review + learn + self.ghosts_due();
                     if self.review_count_auto {
                         self.review_count = due as u32;
                     }
                     self.review_count = self.review_count.min(due as u32);
+                    ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    // 1. Learning session: reviews, plus optional new words (word bank or generated)
+                    ui.vertical(|ui| {
+                    ui.set_width(col_w);
                     card_frame().show(ui, |ui| {
-                        ui.set_width(width - 32.0);
-                        ui.label(RichText::new("Study session").size(17.0));
+                        ui.set_width(col_w - 32.0);
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(RichText::new("Learning session").size(17.0));
+                        ui.label(RichText::new("Due reviews, plus new words if you like.").small().color(MUTED));
                         ui.add_space(4.0);
                         row(ui, |ui| {
                             ui.label("Reviews");
@@ -1925,11 +1935,11 @@ impl DazaiApp {
                                 self.review_count_auto = true;
                             }
                         });
-                        row(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label("New words");
                             let st = &mut self.data.settings;
                             ui.radio_value(&mut st.new_source, NewSource::None, "none");
-                            ui.radio_value(&mut st.new_source, NewSource::Bank, format!("from the word bank ({})", bank.len()));
+                            ui.radio_value(&mut st.new_source, NewSource::Bank, format!("word bank ({})", bank.len()));
                             ui.radio_value(&mut st.new_source, NewSource::Generate, "generate");
                         });
                         let source = self.data.settings.new_source;
@@ -1944,7 +1954,7 @@ impl DazaiApp {
                                     let p = if prio > 0 { format!(" ({prio} flagged priority)") } else { String::new() };
                                     ui.label(RichText::new(format!("of {}{p}", bank.len())).color(MUTED));
                                 });
-                                row(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.add_space(16.0);
                                     ui.label("Order");
                                     ui.radio_value(&mut self.data.settings.new_order, NewOrder::Added, "as added");
@@ -1954,7 +1964,7 @@ impl DazaiApp {
                             }
                             NewSource::Generate => {
                                 let st = &mut self.data.settings;
-                                row(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.add_space(16.0);
                                     ui.label("Words");
                                     ui.add(egui::DragValue::new(&mut st.gen_total).range(1..=50));
@@ -1974,6 +1984,11 @@ impl DazaiApp {
                                 );
                             }
                         }
+                        row(ui, |ui| {
+                            ui.label("English → Japanese");
+                            ui.add(egui::Slider::new(&mut self.data.settings.reverse_percent, 0..=100).suffix("%"))
+                                .on_hover_text("Share of reviews of well-known words asked from the meaning. Replaces the normal question; no extra reviews.");
+                        });
                         ui.add_space(6.0);
                         let reviews = self.review_count as usize;
                         let new = match source {
@@ -2004,12 +2019,16 @@ impl DazaiApp {
                             ui.label(RichText::new(e).small().color(RED));
                         }
                     });
-                    ui.add_space(10.0);
+                    });
 
-                    // 3. Casual random study
+                    // 2. Drilling session: casual practice of passed words
+                    ui.vertical(|ui| {
+                    ui.set_width(col_w);
                     card_frame().show(ui, |ui| {
-                        ui.set_width(width - 32.0);
-                        ui.label(RichText::new("Random study").size(17.0));
+                        ui.set_width(col_w - 32.0);
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(RichText::new("Drilling session").size(17.0));
+                        ui.label(RichText::new("Words you've passed, at random. Stages don't change.").small().color(MUTED));
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
                             ui.label("From");
@@ -2029,36 +2048,38 @@ impl DazaiApp {
                             ui.radio_value(&mut st.casual_timed, false, "set number of words");
                             ui.radio_value(&mut st.casual_timed, true, "timed");
                         });
-                        row(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
                             let st = &mut self.data.settings;
                             if st.casual_timed {
                                 ui.label("Minutes");
                                 ui.add(egui::DragValue::new(&mut st.casual_minutes).range(1..=60));
-                                ui.label(
-                                    RichText::new(format!("random words from {passed} passed, until time runs out"))
-                                        .color(MUTED),
-                                );
+                                ui.label(RichText::new(format!("from {passed} passed words")).color(MUTED));
                             } else {
                                 ui.label("Words");
                                 st.casual_count = st.casual_count.clamp(1, passed.max(1) as u32);
                                 ui.add(egui::DragValue::new(&mut st.casual_count).range(1..=passed.max(1) as u32));
-                                ui.label(RichText::new(format!("of {passed} passed words in those levels")).color(MUTED));
+                                ui.label(RichText::new(format!("of {passed} passed")).color(MUTED));
                             }
+                        });
+                        row(ui, |ui| {
+                            ui.label("English → Japanese");
+                            ui.add(egui::Slider::new(&mut self.data.settings.drill_reverse_percent, 0..=100).suffix("%"))
+                                .on_hover_text("Share of drilled words asked from the meaning.");
                         });
                         if self.data.settings.casual_timed {
                             ui.label(
-                                RichText::new("Missed words don't come back during the run; afterwards you can go over them without a time limit.")
+                                RichText::new("Misses don't come back during the run; review them untimed afterwards.")
                                     .small()
                                     .color(MUTED),
                             );
                         }
-                        ui.label(RichText::new("Casual practice: doesn't change stages or due dates, but misses still leave a ghost review.").small().color(MUTED));
+                        ui.label(RichText::new("Misses leave a ghost review.").small().color(MUTED));
                         ui.add_space(6.0);
                         let timed = self.data.settings.casual_timed;
                         let label = if timed {
-                            format!("Start timed study ({} min)", self.data.settings.casual_minutes)
+                            format!("Start timed drilling ({} min)", self.data.settings.casual_minutes)
                         } else {
-                            "Start random study".to_string()
+                            "Start drilling".to_string()
                         };
                         if ui.add_enabled(passed > 0, egui::Button::new(label).min_size(egui::vec2(200.0, 32.0))).clicked() {
                             if timed {
@@ -2070,7 +2091,9 @@ impl DazaiApp {
                             }
                         }
                     });
-                    // 4. Leeches
+                    });
+                    });
+                    // 3. Leeches
                     let leeches = self.leeches();
                     if !leeches.is_empty() {
                         ui.add_space(10.0);
@@ -3703,16 +3726,14 @@ impl DazaiApp {
             ui.add_space(16.0);
             ui.label(RichText::new("English → Japanese").color(MUTED));
             row(ui, |ui| {
-                ui.label("Ask");
-                ui.add(egui::DragValue::new(&mut d.settings.reverse_percent).range(0..=100).suffix("%"));
-                ui.label("of reviews English → Japanese, for words at stage");
+                ui.label("Ask English → Japanese only for words at stage");
                 ui.add(egui::DragValue::new(&mut d.settings.reverse_min_stage).range(1..=12));
                 let h = d.settings.stage_hours.get(d.settings.reverse_min_stage.saturating_sub(1) as usize).copied().unwrap_or(0.0);
                 ui.label(RichText::new(format!("({}) or higher", srs::format_secs((h * 3600.0) as i64))).color(MUTED));
             });
             ui.label(
                 RichText::new(
-                    "Replaces the normal question for those reviews (no extra reviews), and a word is asked one way per session. 0% = off.",
+                    "How often is set on the Study page (learning and drilling separately). It replaces the normal question (no extra reviews), and a word is asked one way per session.",
                 )
                 .small()
                 .color(MUTED),
