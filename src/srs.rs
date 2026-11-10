@@ -103,6 +103,10 @@ pub struct Settings {
     /// Random study against the clock.
     pub casual_timed: bool,
     pub casual_minutes: u32,
+    /// English → Japanese: share (0–100 %) of eligible reviews asked that way; 0 = off.
+    pub reverse_percent: u32,
+    /// Only words at this SRS stage or higher are asked English → Japanese.
+    pub reverse_min_stage: u32,
 }
 
 impl Default for Settings {
@@ -133,6 +137,8 @@ impl Default for Settings {
             new_source: NewSource::None,
             casual_timed: false,
             casual_minutes: 5,
+            reverse_percent: 30,
+            reverse_min_stage: 5,
         }
     }
 }

@@ -80,6 +80,11 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
   on the menu (with a casual "Practise leeches" session) and in Stats ("forgive" resets lapses).
 - **Conjugate tab**: drill like wkdonc.github.io/conjugation/drill.html, built only from passed
   words: given form → target form, typed in kanji or kana, no effect on scheduling.
+- **English → Japanese**: `choose_reverse` asks a review the other way (meaning shown, type the
+  word in kana or kanji) for `reverse_percent` (default 30%) of words at `reverse_min_stage`
+  (default 5) or higher. Decided once per card per session (`directions`), replacing the normal
+  question, so no extra reviews. A wrong answer that's a JMdict word sharing a gloss
+  (`shares_gloss`) gets a "different word, try again" hint instead of a miss.
 - **Answering**: Enter submits. The IME uses Enter to commit, so an Enter that ends a composition
   is ignored. Esc = "don't know" (reveals, counts as wrong); a 2+ kana composition wiped without a
   commit is also treated as Esc. Kana-only words have no typing step: reveal, then self-grade.

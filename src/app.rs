@@ -299,6 +299,36 @@ fn parse_steps(text: &str) -> Result<Vec<f64>, String> {
         .collect()
 }
 
+/// Whether two dictionary meanings share a gloss ("to study" in both, ignoring "to " and notes
+/// in parentheses).
+fn shares_gloss(a: &str, b: &str) -> bool {
+    let glosses = |m: &str| -> Vec<String> {
+        m.split(|c| c == ';' || c == ',')
+            .map(|g| {
+                let g = g.split('(').next().unwrap_or("").trim().to_lowercase();
+                g.strip_prefix("to ").map(str::to_string).unwrap_or(g)
+            })
+            .filter(|g| !g.is_empty())
+            .collect()
+    };
+    let gb = glosses(b);
+    glosses(a).iter().any(|g| gb.contains(g))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synonyms_share_a_gloss() {
+        assert!(shares_gloss("to learn, to study, to take lessons in", "study; diligence, working hard"));
+        assert!(!shares_gloss("cat", "dog"));
+        // Notes in brackets are ignored: "school (of thought)" counts as "school".
+        assert!(shares_gloss("school (of thought)", "dog; school"));
+        assert!(!shares_gloss("to eat", "to drink"));
+    }
+}
+
 const WORD_TYPES: [&str; 5] = ["verbs", "adjectives", "nouns", "adverbs", "other"];
 
 /// Rough word type from a card's notes ("N5 · verb (godan)"), as an index into WORD_TYPES.
@@ -399,6 +429,10 @@ pub struct DazaiApp {
     word_graph: Option<WordGraph>,
     /// The progress file exists but couldn't be read: never save over it.
     save_blocked: bool,
+    /// The card on screen is asked English → Japanese.
+    reverse: bool,
+    /// Direction chosen for each card this session (so a word is never asked both ways).
+    directions: HashMap<usize, bool>,
     /// Example sentences split into words, per card word (computed once, then reused).
     example_tokens: HashMap<String, Vec<Vec<Token>>>,
     /// word → card index, rebuilt when the number of cards changes.
@@ -465,6 +499,8 @@ impl DazaiApp {
             summary_since: None,
             summary_end: None,
             example_tokens: HashMap::new(),
+            reverse: false,
+            directions: HashMap::new(),
             card_index: (0, HashMap::new()),
             drill: Drill::default(),
             session: None,
@@ -1090,7 +1126,67 @@ impl DazaiApp {
         }
     }
 
+    /// Whether to ask this card English → Japanese: only well-known words, a set share of the
+    /// time, and decided once per session so the same word never comes both ways.
+    fn choose_reverse(&mut self, idx: usize) -> bool {
+        if self.session.is_none() {
+            self.directions.clear();
+        }
+        if let Some(&d) = self.directions.get(&idx) {
+            return d;
+        }
+        let s = &self.data.settings;
+        let st = self.state(idx);
+        let eligible = s.reverse_percent > 0
+            && st.phase == Phase::Review
+            && srs::stage_of(&st, s) >= s.reverse_min_stage
+            && !self.cards[idx].meaning.trim().is_empty();
+        let percent = s.reverse_percent.min(100) as u64;
+        let d = eligible && self.rand() % 100 < percent;
+        self.directions.insert(idx, d);
+        d
+    }
+
+    /// English → Japanese answer: the word (kanji or kana) or any of its readings.
+    fn submit_reverse(&mut self) {
+        let Study::Asking { idx, input, hint } = &mut self.study else { return };
+        let idx = *idx;
+        let typed = input.trim().to_string();
+        if typed.is_empty() {
+            return;
+        }
+        if check::looks_like_romaji(&typed) {
+            *hint = Some("That's romaji. Switch the keyboard to hiragana (Alt + `).".into());
+            return;
+        }
+        let card = &self.cards[idx];
+        let n = check::normalize(&typed);
+        let verdict = if check::normalize(&card.word) == n {
+            Verdict::Correct
+        } else {
+            check::check(&typed, &card.readings, self.data.settings.check_mode)
+        };
+        if verdict == Verdict::Wrong {
+            // Another word with the same meaning isn't wrong: say so and let them try again.
+            if let Some(other) = crate::jmdict::lookup(&typed, None).filter(|e| shares_gloss(&e.meaning, &card.meaning)) {
+                *hint = Some(format!(
+                    "{} ({}) also means that, but we're looking for a different word. Try again.",
+                    other.word, other.reading
+                ));
+                input.clear();
+                return;
+            }
+            self.grade(idx, false);
+        }
+        self.study = Study::Revealed { idx, typed, verdict };
+        self.on_reveal(idx);
+    }
+
     fn submit(&mut self) {
+        if self.reverse {
+            self.submit_reverse();
+            return;
+        }
         let Study::Asking { idx, input, hint } = &mut self.study else { return };
         let idx = *idx;
         let typed = input.trim().to_string();
@@ -1584,6 +1680,7 @@ impl DazaiApp {
                 Some(idx) => {
                     let word = self.cards[idx].word.clone();
                     self.request_sentences(&word);
+                    self.reverse = self.choose_reverse(idx);
                     Study::Asking { idx, input: String::new(), hint: None }
                 }
                 None => Study::Done,
@@ -1665,14 +1762,18 @@ impl DazaiApp {
             }
             Study::Asking { idx, input, hint } => {
                 let card = &self.cards[*idx];
+                let reverse = self.reverse;
                 // Kana-only words (onomatopoeia, loanwords…) have nothing to type: just reveal.
-                let kana_card = !card.word.chars().any(dict::is_kanji);
+                let kana_card = !card.word.chars().any(dict::is_kanji) && !reverse;
                 let mut submit = false;
                 let mut quit = false;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&status).small().color(MUTED));
                     if let Some((t, c)) = tag {
                         ui.label(RichText::new(t).small().color(c));
+                    }
+                    if reverse {
+                        ui.label(RichText::new("English → Japanese").small().color(BLUE));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new("End session").small().color(MUTED)).frame(false)).clicked() {
@@ -1682,7 +1783,18 @@ impl DazaiApp {
                 });
                 ui.vertical_centered(|ui| {
                     ui.add_space((avail * 0.18).max(20.0));
-                    ui.label(RichText::new(&card.word).font(display_font(76.0)).strong());
+                    if reverse {
+                        // The meaning, and the part of speech as a nudge (without the level tags).
+                        ui.set_max_width(ui.available_width().min(600.0));
+                        ui.add(egui::Label::new(RichText::new(&card.meaning).size(26.0)).wrap());
+                        let pos: Vec<&str> =
+                            card.notes.split(" · ").filter(|t| !matches!(*t, "N5" | "N4" | "N3" | "N2" | "N1" | "Kaishi")).collect();
+                        if !pos.is_empty() {
+                            ui.label(RichText::new(pos.join(" · ")).small().color(MUTED));
+                        }
+                    } else {
+                        ui.label(RichText::new(&card.word).font(display_font(76.0)).strong());
+                    }
                     ui.add_space(24.0);
                     if kana_card {
                         let space = ui.input(|i| i.key_pressed(Key::Space));
@@ -1700,14 +1812,20 @@ impl DazaiApp {
                         .font(FontId::new(28.0, FontFamily::Proportional))
                         .horizontal_align(egui::Align::Center)
                         .desired_width(300.0)
-                        .hint_text(RichText::new("よみかた").color(MUTED.gamma_multiply(0.6)))
+                        .hint_text(RichText::new(if reverse { "日本語" } else { "よみかた" }).color(MUTED.gamma_multiply(0.6)))
                         .margin(egui::Margin::symmetric(8, 8));
                     ui.add(edit).request_focus();
                     ui.add_space(6.0);
                     match hint {
                         Some(h) => ui.label(RichText::new(h.as_str()).color(AMBER)),
                         None => ui.label(
-                            RichText::new("type the reading, then Enter  ·  Esc if you don't know it").small().color(MUTED),
+                            RichText::new(if reverse {
+                                "type the Japanese word (kana or kanji), then Enter  ·  Esc if you don't know it"
+                            } else {
+                                "type the reading, then Enter  ·  Esc if you don't know it"
+                            })
+                            .small()
+                            .color(MUTED),
                         ),
                     };
                     submit = enter;
@@ -3582,6 +3700,23 @@ impl DazaiApp {
             ui.checkbox(&mut d.settings.autoplay_audio, "Play native audio when the answer is shown");
             ui.checkbox(&mut d.settings.show_pitch, "Show pitch accent");
             ui.checkbox(&mut d.settings.show_sentences, "Show example sentences (Tatoeba)");
+            ui.add_space(16.0);
+            ui.label(RichText::new("English → Japanese").color(MUTED));
+            row(ui, |ui| {
+                ui.label("Ask");
+                ui.add(egui::DragValue::new(&mut d.settings.reverse_percent).range(0..=100).suffix("%"));
+                ui.label("of reviews English → Japanese, for words at stage");
+                ui.add(egui::DragValue::new(&mut d.settings.reverse_min_stage).range(1..=12));
+                let h = d.settings.stage_hours.get(d.settings.reverse_min_stage.saturating_sub(1) as usize).copied().unwrap_or(0.0);
+                ui.label(RichText::new(format!("({}) or higher", srs::format_secs((h * 3600.0) as i64))).color(MUTED));
+            });
+            ui.label(
+                RichText::new(
+                    "Replaces the normal question for those reviews (no extra reviews), and a word is asked one way per session. 0% = off.",
+                )
+                .small()
+                .color(MUTED),
+            );
             ui.add_space(16.0);
             ui.label(RichText::new("Misses").color(MUTED));
             ui.checkbox(&mut d.settings.ghosts, "Ghost reviews: after a miss, extra reviews in 1 day, 3 days and 1 week (Bunpro-style)");
