@@ -220,6 +220,21 @@ pub fn lookup(word: &str, reading: Option<&str>) -> Option<Entry> {
     best.first().map(|r| entry(r))
 }
 
+/// Other spellings of a word (from its JMdict entries), e.g. これ → 此れ.
+pub fn spellings(word: &str) -> Vec<String> {
+    let d = dict();
+    let mut out: Vec<String> = Vec::new();
+    for &i in d.exact.get(word).into_iter().flatten() {
+        let r = &d.recs[i as usize];
+        for s in std::iter::once(r.word).chain(r.readings()).chain(r.forms()) {
+            if s != word && !out.iter().any(|o| o == s) {
+                out.push(s.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Whether a spelling is a dictionary headword.
 pub fn contains(word: &str) -> bool {
     dict().exact.get(word).is_some_and(|ids| ids.iter().any(|&i| dict().recs[i as usize].word == word))

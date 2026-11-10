@@ -486,7 +486,10 @@ impl DazaiApp {
         app.save();
         app.spawn(|| Msg::Pitch(dict::load_pitch_db()));
         // Unpack the bundled dictionary in the background so the first search is instant.
-        std::thread::spawn(crate::jmdict::preload);
+        std::thread::spawn(|| {
+            crate::jmdict::preload();
+            crate::examples::preload();
+        });
         app
     }
 
@@ -1564,7 +1567,11 @@ impl DazaiApp {
         if matches!(self.study, Study::Pick) || srs_waiting {
             self.roll_day();
             self.study = match self.pick_next() {
-                Some(idx) => Study::Asking { idx, input: String::new(), hint: None },
+                Some(idx) => {
+                    let word = self.cards[idx].word.clone();
+                    self.request_sentences(&word);
+                    Study::Asking { idx, input: String::new(), hint: None }
+                }
                 None => Study::Done,
             };
         }
@@ -2122,7 +2129,8 @@ impl DazaiApp {
                     }
                     Some(Remote::Ready(v)) => {
                         for snt in v {
-                            ui.add(egui::Label::new(highlight(&snt.jp, &word, 19.0)).wrap());
+                            let target = snt.highlight.as_deref().unwrap_or(&word);
+                            ui.add(egui::Label::new(highlight(&snt.jp, target, 19.0)).wrap());
                             ui.add(egui::Label::new(RichText::new(&snt.en).size(14.0).color(MUTED)).wrap());
                             ui.add_space(6.0);
                         }

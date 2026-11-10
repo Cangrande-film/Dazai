@@ -5,6 +5,7 @@ mod audio;
 mod check;
 mod conjugate;
 mod dict;
+mod examples;
 mod extract;
 mod jmdict;
 mod levels;

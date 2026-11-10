@@ -190,6 +190,9 @@ pub fn lookup_pitch<'a>(db: &'a PitchDb, word: &str, reading: &str) -> Option<&'
 pub struct Sentence {
     pub jp: String,
     pub en: String,
+    /// How the word appears in the sentence (食べた for 食べる), when known.
+    #[serde(default)]
+    pub highlight: Option<String>,
 }
 
 const TATOEBA: &str = "https://tatoeba.org/en/api_v0/search";
@@ -236,8 +239,13 @@ fn tatoeba_page(query: &str, page: usize) -> Result<TatoebaResp, String> {
         .map_err(|e| format!("Tatoeba: {e}"))
 }
 
-/// Up to three example sentences with English translations (Tatoeba, CC BY 2.0 FR), cached on disk.
+/// Up to three example sentences with English translations: from the bundled Tanaka Corpus
+/// (instant, offline), or for words it doesn't cover from Tatoeba online (cached on disk).
 pub fn sentences(word: &str) -> Result<Vec<Sentence>, String> {
+    let local = crate::examples::for_word(word, 3);
+    if !local.is_empty() {
+        return Ok(local);
+    }
     let safe: String = word.chars().map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect();
     let path = data_dir().join("sentences").join(format!("{safe}.json"));
     if let Some(v) = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()) {
@@ -257,7 +265,7 @@ pub fn sentences(word: &str) -> Result<Vec<Sentence>, String> {
         .into_iter()
         .filter_map(|s| {
             let en = s.translations.iter().flatten().find(|t| t.lang.as_deref() == Some("eng"))?.text.clone();
-            Some(Sentence { jp: s.text, en })
+            Some(Sentence { jp: s.text, en, highlight: None })
         })
         .collect();
     out.sort_by_key(|s| (s.jp.chars().count() as i64 - 18).abs());

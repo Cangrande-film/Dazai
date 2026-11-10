@@ -1,0 +1,6 @@
+Example sentences: the Tanaka Corpus, as maintained by the Tatoeba project
+(https://tatoeba.org) and distributed by EDRDG as examples.utf
+(http://ftp.edrdg.org/pub/Nihongo/examples.utf.gz).
+Licence: Creative Commons Attribution 2.0 France (CC BY 2.0 FR).
+Converted into assets/examples.tsv.gz: up to 5 sentences per dictionary word,
+with the form the word takes in each sentence.
