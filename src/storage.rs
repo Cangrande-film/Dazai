@@ -62,10 +62,13 @@ pub struct SaveData {
     /// Study day ("YYYY-MM-DD") the counter below belongs to.
     pub new_day: String,
     pub new_count: u32,
-    /// Answer history, kept in memory. On disk it's the append-only `reviews.jsonl`; older
-    /// progress files that still contain it are read once and migrated.
-    #[serde(skip_serializing)]
+    /// Answer history, kept in memory. On disk it's the append-only `reviews.jsonl`.
+    #[serde(skip)]
     pub log: Vec<ReviewLog>,
+    /// Answers not yet in reviews.jsonl (from older progress files, or a failed write). Kept
+    /// in progress.json until they've been appended, so history is never lost.
+    #[serde(default, rename = "log", skip_serializing_if = "Vec::is_empty")]
+    pub pending_log: Vec<ReviewLog>,
 }
 
 /// `%APPDATA%\Dazai` on Windows.
@@ -247,12 +250,17 @@ pub fn load_progress() -> (SaveData, Option<String>) {
             // Skip entries already there (an older app version may have written them back).
             let mut log = load_log();
             let known: HashSet<(i64, String, bool)> = log.iter().map(|l| (l.t, l.id.clone(), l.good)).collect();
-            for l in data.log.drain(..) {
-                if !known.contains(&(l.t, l.id.clone(), l.good)) {
-                    append_log(&l);
-                    log.push(l);
+            let mut still_pending = Vec::new();
+            for l in data.pending_log.drain(..) {
+                if known.contains(&(l.t, l.id.clone(), l.good)) {
+                    continue;
                 }
+                if append_log(&l).is_err() {
+                    still_pending.push(l.clone());
+                }
+                log.push(l);
             }
+            data.pending_log = still_pending;
             log.sort_by_key(|l| l.t);
             data.log = log;
             (data, None)
@@ -284,15 +292,12 @@ pub fn load_log() -> Vec<ReviewLog> {
         .unwrap_or_default()
 }
 
-pub fn append_log(entry: &ReviewLog) {
+pub fn append_log(entry: &ReviewLog) -> Result<(), String> {
     use std::io::Write;
     let _ = fs::create_dir_all(data_dir());
-    if let (Ok(mut f), Ok(line)) = (
-        fs::OpenOptions::new().create(true).append(true).open(log_path()),
-        serde_json::to_string(entry),
-    ) {
-        let _ = writeln!(f, "{line}");
-    }
+    let line = serde_json::to_string(entry).map_err(|e| e.to_string())?;
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(log_path()).map_err(|e| e.to_string())?;
+    writeln!(f, "{line}").map_err(|e| e.to_string())
 }
 
 pub fn clear_log() {

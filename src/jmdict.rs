@@ -122,15 +122,11 @@ fn japanese_hits(d: &Dict, q: &str, tier: u8, hits: &mut Vec<(u8, u32)>) {
             hits.extend(ids.iter().map(|&i| (tier, i)));
         }
     }
-    // Words starting with the query (by spelling or reading).
-    let mut prefix = 0;
+    // Words starting with the query (by spelling or reading). All of them are ranked, so
+    // common words aren't cut off by where they happen to sit in the file.
     for (i, r) in d.recs.iter().enumerate() {
-        if prefix >= 200 {
-            break;
-        }
         if (r.word.starts_with(q) && r.word != q) || r.readings().any(|x| x.starts_with(hira.as_str()) && x != hira) {
             hits.push((tier + 1, i as u32));
-            prefix += 1;
         }
     }
 }
@@ -235,6 +231,23 @@ pub fn spellings(word: &str) -> Vec<String> {
     out
 }
 
+/// Other ways of writing the same word, without falling back to a bare kana reading for a
+/// kanji word (要る must not borrow いる's examples). これ → 此れ is fine.
+pub fn written_forms(word: &str) -> Vec<String> {
+    let has_kanji = word.chars().any(is_kanji);
+    spellings(word)
+        .into_iter()
+        .filter(|s| !has_kanji || s.chars().any(is_kanji))
+        .filter(|s| {
+            // Only spellings of entries whose headword is this word, not unrelated homographs.
+            dict().exact.get(s.as_str()).is_some_and(|ids| ids.iter().any(|&i| {
+                let r = &dict().recs[i as usize];
+                r.word == word || r.forms().any(|f| f == word)
+            }))
+        })
+        .collect()
+}
+
 /// Whether a spelling is a dictionary headword.
 pub fn contains(word: &str) -> bool {
     dict().exact.get(word).is_some_and(|ids| ids.iter().any(|&i| dict().recs[i as usize].word == word))
@@ -330,5 +343,13 @@ mod tests {
         assert_eq!(lookup("行く", Some("いく")).unwrap().reading, "いく");
         assert_eq!(lookup("これ", None).unwrap().pos, "pronoun");
         assert!(words_with_kanji('猫').iter().any(|e| e.word == "子猫"));
+        // Short prefixes still rank common words first, wherever they sit in the file.
+        assert!(search("こど").iter().take(5).any(|e| e.word == "子供"));
+        // Other written forms, but not a bare reading for a kanji word.
+        assert!(!written_forms("要る").iter().any(|s| s == "いる"));
+        assert!(written_forms("これ").iter().any(|s| s == "此れ"));
+        // English → Japanese: 子ども is 子供 written differently; びよういん is a different word.
+        assert!(spellings("子供").iter().any(|s| s == "子ども"));
+        assert_eq!(lookup("びよういん", None).unwrap().word, "美容院");
     }
 }

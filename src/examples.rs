@@ -50,7 +50,7 @@ pub fn preload() {
 pub fn for_word(word: &str, n: usize) -> Vec<Sentence> {
     let ex = EXAMPLES.get_or_init(load);
     let mut keys = vec![word.to_string()];
-    keys.extend(crate::jmdict::spellings(word));
+    keys.extend(crate::jmdict::written_forms(word));
     for key in keys {
         if let Some(items) = ex.words.get(key.as_str()) {
             return items

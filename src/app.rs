@@ -941,6 +941,7 @@ impl DazaiApp {
     /// Starts an SRS session: up to `reviews` due reviews (ghosts included) plus these new words.
     fn start_session(&mut self, new_words: Vec<usize>, reviews: usize, label: String) {
         self.session_label = label;
+        self.begin_session();
         self.session = Some(Session::Srs {
             new_queue: new_words.into(),
             retry: VecDeque::new(),
@@ -998,6 +999,7 @@ impl DazaiApp {
         passed.truncate(n);
         let total = passed.len();
         self.session_label = format!("Drilling · {total} words");
+        self.begin_session();
         self.session = Some(Session::Casual {
             queue: passed.into(),
             right: 0,
@@ -1016,6 +1018,7 @@ impl DazaiApp {
         self.shuffle(&mut pool);
         let minutes = minutes.clamp(1, 60);
         self.session_label = format!("Timed drilling · {minutes} min");
+        self.begin_session();
         self.session = Some(Session::Casual {
             queue: pool.into(),
             right: 0,
@@ -1112,8 +1115,9 @@ impl DazaiApp {
             phase: before.phase,
             ivl: before.interval,
         };
-        if !self.save_blocked {
-            storage::append_log(&entry);
+        if !self.save_blocked && storage::append_log(&entry).is_err() {
+            // Couldn't write reviews.jsonl: keep it in progress.json until it can be.
+            self.data.pending_log.push(entry.clone());
         }
         self.data.log.push(entry);
         self.data.states.insert(self.cards[idx].id.clone(), after);
@@ -1129,12 +1133,16 @@ impl DazaiApp {
         }
     }
 
+    /// Resets what belongs to one session: card directions and the end-of-session stats clock.
+    fn begin_session(&mut self) {
+        self.directions.clear();
+        self.summary_since = None;
+        self.summary_end = None;
+    }
+
     /// Whether to ask this card English → Japanese: only well-known words, a set share of the
     /// time, and decided once per session so the same word never comes both ways.
     fn choose_reverse(&mut self, idx: usize) -> bool {
-        if self.session.is_none() {
-            self.directions.clear();
-        }
         if let Some(&d) = self.directions.get(&idx) {
             return d;
         }
@@ -1159,17 +1167,28 @@ impl DazaiApp {
         if typed.is_empty() {
             return;
         }
-        if check::looks_like_romaji(&typed) {
+        let card = &self.cards[idx];
+        let n = check::normalize(&typed);
+        // The word itself or one of its own spellings (子ども for 子供) is right, Latin letters
+        // included (Tシャツ, CD), so check that before the romaji warning.
+        let own_spelling = check::normalize(&card.word) == n
+            || crate::jmdict::spellings(&card.word).iter().any(|s| check::normalize(s) == n);
+        if !own_spelling && check::looks_like_romaji(&typed) {
             *hint = Some("That's romaji. Switch the keyboard to hiragana (Alt + `).".into());
             return;
         }
-        let card = &self.cards[idx];
-        let n = check::normalize(&typed);
-        let verdict = if check::normalize(&card.word) == n {
+        let mut verdict = if own_spelling {
             Verdict::Correct
         } else {
             check::check(&typed, &card.readings, self.data.settings.check_mode)
         };
+        // Relaxed mode forgives a slipped kana, but not when the answer is a different real word
+        // (びよういん is 美容院, not 病院).
+        if verdict == Verdict::Close {
+            if crate::jmdict::lookup(&typed, None).is_some_and(|e| e.word != card.word) {
+                verdict = Verdict::Wrong;
+            }
+        }
         if verdict == Verdict::Wrong {
             // Another word with the same meaning isn't wrong: say so and let them try again.
             if let Some(other) = crate::jmdict::lookup(&typed, None).filter(|e| shares_gloss(&e.meaning, &card.meaning)) {
@@ -1245,6 +1264,7 @@ impl DazaiApp {
         self.shuffle(&mut v);
         let total = v.len();
         self.session_label = format!("Leech practice · {total} words");
+        self.begin_session();
         self.session = Some(Session::Casual {
             queue: v.into(),
             right: 0,
@@ -1479,7 +1499,8 @@ impl DazaiApp {
         if let Some(list) = again {
             let total = list.len();
             self.session_label = format!("Missed words · {total}");
-            self.session = Some(Session::Casual {
+            self.begin_session();
+        self.session = Some(Session::Casual {
                 queue: list.into(),
                 right: 0,
                 answered: 0,
@@ -3894,6 +3915,8 @@ impl DazaiApp {
         if reset {
             self.data.states.clear();
             self.data.log.clear();
+            self.data.pending_log.clear();
+            self.begin_session();
             if !self.save_blocked {
                 storage::clear_log();
             }
