@@ -150,6 +150,8 @@ struct Drill {
     groups: [bool; 7],
     trick: bool,
     furigana: bool,
+    /// Show the word's meaning with the question.
+    meaning: bool,
     run: Option<DrillRun>,
 }
 
@@ -161,9 +163,10 @@ impl Default for Drill {
             polite: true,
             negative: true,
             past: true,
-            groups: [true, true, true, true, true, false, false],
-            trick: true,
+            groups: [true, true, false, true, true, false, false],
+            trick: false,
             furigana: true,
+            meaning: true,
             run: None,
         }
     }
@@ -2930,6 +2933,7 @@ impl DazaiApp {
             return;
         }
         let furigana = self.drill.furigana;
+        let show_meaning = self.drill.meaning;
         let run = self.drill.run.as_mut().unwrap();
         let avail = ui.available_height();
 
@@ -2994,7 +2998,13 @@ impl DazaiApp {
                 ui.label(RichText::new(&q.shown.reading).size(16.0).color(MUTED));
             }
             ui.label(RichText::new(&q.shown.surface).font(display_font(52.0)));
-            ui.label(RichText::new(q.from.describe()).small().color(MUTED));
+            if show_meaning {
+                ui.add(egui::Label::new(RichText::new(&q.word.meaning).size(14.0).color(SOFT)).wrap());
+            }
+            // The given form is named only after answering, so it doesn't give the answer away.
+            if run.result.is_some() {
+                ui.label(RichText::new(format!("given: {}", q.from.describe())).small().color(MUTED));
+            }
             ui.add_space(14.0);
             ui.label(RichText::new("Change to").small().color(MUTED));
             ui.label(RichText::new(q.to.describe()).size(22.0).color(AMBER));
@@ -3093,6 +3103,7 @@ impl DazaiApp {
                 cols[1].label(RichText::new("Options").color(MUTED));
                 cols[1].checkbox(&mut d.trick, "Trick questions (answer may be the given form)");
                 cols[1].checkbox(&mut d.furigana, "Furigana on the given form");
+                cols[1].checkbox(&mut d.meaning, "Show the word's meaning");
             });
             ui.add_space(10.0);
             ui.label(RichText::new(format!("{pool} learned words in the selected groups")).color(MUTED));
