@@ -1,0 +1,8 @@
+Dictionary data: JMdict (Japanese-Multilingual Dictionary)
+Copyright the Electronic Dictionary Research and Development Group (EDRDG),
+used in conformance with the Group's licence: Creative Commons
+Attribution-ShareAlike 4.0 (https://www.edrdg.org/edrdg/licence.html).
+Converted from jmdict-simplified (https://github.com/scriptin/jmdict-simplified)
+into assets/jmdict.tsv.gz (word, readings, other forms, common flag,
+part of speech, first three senses). The converted file is shared under the
+same CC BY-SA 4.0 licence.

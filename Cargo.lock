@@ -893,6 +893,7 @@ dependencies = [
  "chrono",
  "dirs",
  "eframe",
+ "flate2",
  "native-tls",
  "rodio",
  "serde",

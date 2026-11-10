@@ -2,6 +2,14 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+static SHARED: OnceLock<Jlpt> = OnceLock::new();
+
+/// The level table, loaded once and shared.
+pub fn get() -> &'static Jlpt {
+    SHARED.get_or_init(Jlpt::load)
+}
 
 pub const LEVELS: [&str; 5] = ["N5", "N4", "N3", "N2", "N1"];
 

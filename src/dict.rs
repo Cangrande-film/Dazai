@@ -1,5 +1,6 @@
-//! Online sources: Jisho (dictionary), kanjiapi.dev (kanji info), JapanesePod101 (audio),
-//! Kanjium (pitch accent dataset). Everything here is blocking; call it from worker threads.
+//! Data sources. The dictionary is bundled JMdict (offline, see jmdict.rs); online: kanjiapi.dev
+//! (kanji info), JapanesePod101 (audio), Kanjium (pitch accent), Tatoeba (sentences), a frequency
+//! list. Network calls are blocking; call them from worker threads.
 
 use crate::storage::data_dir;
 use serde::{Deserialize, Serialize};
@@ -7,8 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::Duration;
 
-const USER_AGENT: &str = "Dazai/0.2 (personal SRS app)";
-const JISHO: &str = "https://jisho.org/api/v1/search/words";
+const USER_AGENT: &str = "Dazai/0.3 (personal SRS app)";
 const KANJIAPI: &str = "https://kanjiapi.dev/v1/kanji/";
 const JPOD: &str = "https://assets.languagepod101.com/dictionary/japanese/audiomp3.php";
 const KANJIUM: &str =
@@ -43,7 +43,7 @@ pub fn kanji_of(word: &str) -> Vec<char> {
     out
 }
 
-// ------------------------------------------------------------------ Jisho
+// ------------------------------------------------------------------ Dictionary (bundled JMdict)
 
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -55,111 +55,14 @@ pub struct Entry {
     pub jlpt: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct JishoResp {
-    data: Vec<JishoItem>,
-}
-
-#[derive(Deserialize)]
-struct JishoItem {
-    #[serde(default)]
-    is_common: Option<bool>,
-    #[serde(default)]
-    jlpt: Vec<String>,
-    japanese: Vec<JishoJp>,
-    senses: Vec<JishoSense>,
-}
-
-#[derive(Deserialize)]
-struct JishoJp {
-    word: Option<String>,
-    reading: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct JishoSense {
-    #[serde(default)]
-    english_definitions: Vec<String>,
-    #[serde(default)]
-    parts_of_speech: Vec<String>,
-}
-
+/// Dictionary search (offline, bundled JMdict): Japanese, `*学*` wildcards, English or romaji.
 pub fn search(keyword: &str) -> Result<Vec<Entry>, String> {
-    let resp: JishoResp = agent()
-        .get(JISHO)
-        .query("keyword", keyword)
-        .call()
-        .map_err(|e| format!("Jisho: {e}"))?
-        .into_json()
-        .map_err(|e| format!("Jisho: {e}"))?;
-
-    let mut out = Vec::new();
-    for item in resp.data {
-        let Some(jp) = item.japanese.first() else { continue };
-        let reading = jp.reading.clone().unwrap_or_default();
-        let word = jp.word.clone().unwrap_or_else(|| reading.clone());
-        if word.is_empty() || reading.is_empty() {
-            continue;
-        }
-        const NAME_POS: [&str; 9] = [
-            "Wikipedia definition", "Place", "Full name", "Surname", "Given name",
-            "Company name", "Organization name", "Product name", "Station name",
-        ];
-        let is_name = |s: &&JishoSense| s.parts_of_speech.iter().any(|p| NAME_POS.contains(&p.as_str()));
-        let all: Vec<&JishoSense> = item.senses.iter().filter(|s| !s.english_definitions.is_empty()).collect();
-        // Drop proper-noun senses, unless that's all the entry has.
-        let senses: Vec<&JishoSense> = if all.iter().any(|s| !is_name(s)) {
-            all.into_iter().filter(|s| !is_name(s)).collect()
-        } else {
-            all
-        };
-        let meaning = senses
-            .iter()
-            .take(3)
-            .map(|s| s.english_definitions.iter().take(3).cloned().collect::<Vec<_>>().join(", "))
-            .collect::<Vec<_>>()
-            .join("; ");
-        let pos = senses
-            .first()
-            .map(|s| s.parts_of_speech.iter().map(|p| simplify_pos(p)).collect::<Vec<_>>().join(", "))
-            .unwrap_or_default();
-        out.push(Entry {
-            word,
-            reading,
-            meaning,
-            pos,
-            common: item.is_common.unwrap_or(false),
-            jlpt: item.jlpt.first().map(|j| j.replace("jlpt-", "").to_uppercase()),
-        });
-    }
-    Ok(out)
+    Ok(crate::jmdict::search(keyword))
 }
 
-fn simplify_pos(p: &str) -> String {
-    let lower = p.to_lowercase();
-    if lower.starts_with("godan verb") {
-        "verb (godan)".into()
-    } else if lower.starts_with("ichidan verb") {
-        "verb (ichidan)".into()
-    } else if lower.starts_with("suru verb") {
-        "suru verb".into()
-    } else if lower.starts_with("i-adjective") {
-        "i-adjective".into()
-    } else if lower.starts_with("na-adjective") {
-        "na-adjective".into()
-    } else {
-        lower
-    }
-}
-
-/// Common words that contain `kanji`, via Jisho's wildcard search.
+/// Common words that contain `kanji`.
 pub fn words_with_kanji(kanji: char) -> Result<Vec<Entry>, String> {
-    let mut words: Vec<Entry> = search(&format!("*{kanji}*"))?
-        .into_iter()
-        .filter(|e| e.word.contains(kanji))
-        .collect();
-    words.sort_by_key(|e| !e.common);
-    Ok(words)
+    Ok(crate::jmdict::words_with_kanji(kanji))
 }
 
 // ------------------------------------------------------------------ Kanji info
@@ -398,7 +301,7 @@ fn is_japanese_word(w: &str) -> bool {
 }
 
 /// Picks new words for a study session: `with_known` that share a kanji with `known_kanji`, and
-/// `without` whose kanji are all new. Most frequent first; each word is confirmed on Jisho.
+/// `without` whose kanji are all new. Most frequent first; each word must be a JMdict headword.
 pub fn generate_session(
     with_known: usize,
     without: usize,
@@ -417,7 +320,7 @@ pub fn generate_session(
         if got_known >= with_known && got_new >= without {
             break;
         }
-        if !is_japanese_word(w) || existing.contains(w) || dictionary.is_some_and(|d| !d.contains(w)) {
+        if !is_japanese_word(w) || existing.contains(w) || dictionary.is_some_and(|d| !d.contains(w)) || !crate::jmdict::contains(w) {
             continue;
         }
         let ks = kanji_of(w);
@@ -429,8 +332,7 @@ pub fn generate_session(
         if tries > max_tries {
             break;
         }
-        progress(format!("Checking {w} on Jisho… ({}/{})", got_known + got_new, with_known + without));
-        let Some(e) = search(w)?.into_iter().find(|e| e.word == *w && !e.meaning.is_empty()) else { continue };
+        let Some(e) = crate::jmdict::lookup(w, None).filter(|e| e.word == *w && !e.meaning.is_empty()) else { continue };
         // Skip grammatical pieces (的, 等, 達…) that a frequency list ranks high but make poor cards.
         const PARTS: [&str; 7] = ["suffix", "prefix", "counter", "particle", "auxiliary", "conjunction", "expression"];
         if PARTS.iter().any(|p| e.pos.contains(p)) || (w.chars().count() == 1 && !e.pos.starts_with("noun")) {
@@ -441,8 +343,8 @@ pub fn generate_session(
         } else {
             got_new += 1;
         }
+        progress(format!("Picked {} of {}…", got_known + got_new, with_known + without));
         picked.push(e);
-        std::thread::sleep(Duration::from_millis(150));
     }
     if picked.is_empty() {
         return Err("Couldn't find any new words.".into());
@@ -454,7 +356,7 @@ pub fn generate_session(
 mod net_tests {
     use super::*;
 
-    /// Hits Tatoeba, the frequency list and Jisho. Run with `cargo test -- --ignored`.
+    /// Hits Tatoeba and the frequency list. Run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
     fn online_sources() {
@@ -462,7 +364,7 @@ mod net_tests {
         println!("sentences: {s:?}");
         assert!(!s.is_empty());
         let deck: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string("decks/jlpt_n5_n4.json").unwrap()).unwrap();
+            serde_json::from_str(include_str!("../decks/known.json")).unwrap();
         let existing: HashSet<String> =
             deck["cards"].as_array().unwrap().iter().map(|c| c["word"].as_str().unwrap().to_string()).collect();
         let known: HashSet<char> = existing.iter().flat_map(|w| kanji_of(w)).collect();

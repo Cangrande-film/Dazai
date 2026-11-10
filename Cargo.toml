@@ -12,6 +12,7 @@ chrono = "0.4"
 dirs = "6"
 ureq = { version = "2", default-features = false, features = ["json", "gzip", "native-tls"] }
 native-tls = "0.2"
+flate2 = "1"
 rodio = { version = "0.20", default-features = false, features = ["symphonia-mp3"] }
 
 [profile.release]

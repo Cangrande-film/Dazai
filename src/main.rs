@@ -6,6 +6,7 @@ mod check;
 mod conjugate;
 mod dict;
 mod extract;
+mod jmdict;
 mod levels;
 mod graph;
 mod pitch;

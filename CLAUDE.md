@@ -30,7 +30,8 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 | `src/srs.rs` | Settings and scheduling. Default is Bunpro-style: SRS stages with fixed hour intervals (`DEFAULT_STAGE_HOURS`: 4h…1y), due times rounded up to the hour (`ceil_hour`), +1 stage when right, -1 when wrong (-2 from stage 7). Anki-style SM-2 is the alternative (`Scheduler::Anki`). Cards from the Anki scheduler get a stage derived from their interval (`stage_of`). |
 | `src/check.rs` | Answer checking: strict / relaxed (katakana→hiragana, small-kana slips, Levenshtein). |
 | `src/storage.rs` | Deck loading (bundled decks + `decks/` folders), card ids (`word|first reading`), progress file, user cards. |
-| `src/dict.rs` | Network sources (all blocking; called from worker threads): Jisho search, kanjiapi.dev, JapanesePod101 audio, Kanjium pitch data, Tatoeba sentences, frequency list, generated sessions. |
+| `src/jmdict.rs` | Offline dictionary: JMdict bundled as `assets/jmdict.tsv.gz` (built from jmdict-simplified by a converter script; CC BY-SA 4.0, see `assets/JMdict-LICENSE.txt`). Loaded once (`preload` at startup, ~100 MB RAM); `search` (Japanese exact/prefix, `*学*` wildcards, English with first-meaning ranking, romaji→kana), `lookup`, `contains`, `words_with_kanji`. |
+| `src/dict.rs` | Data sources: `search`/`words_with_kanji` wrap jmdict.rs; network (blocking, worker threads): kanjiapi.dev, JapanesePod101 audio, Kanjium pitch data, Tatoeba sentences, frequency list; `generate_session` (frequency order, JMdict headwords only). |
 | `src/extract.rs` | Splits pasted text into words: longest match against the Kanjium word list plus a deinflection table; also katakana words and reduplicated onomatopoeia. |
 | `src/conjugate.rs` | Verb/adjective conjugation on (surface, reading) pairs: `classify` (from card notes POS), `conjugate(word, Form)` → accepted answers (canonical first). Forms: plain/polite × negative × past, て, progressive, desire, volitional, potential, imperative, passive, causative. Test `whole_known_deck` conjugates every known word. |
 | `src/pitch.rs` | Draws readings with their pitch-accent line. |
@@ -40,8 +41,8 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 
 ## Data
 
-- `decks/known.json` (`"known": true`): 2,091 cards = JLPT N5+N4 (Jisho tags, kana words
-  included) + Kaishi 1.5k (meanings from Jisho). Cards from a known deck with no saved state start
+- `decks/known.json` (`"known": true`): 2,091 cards = JLPT N5+N4 (Jisho's JLPT tags, kana words
+  included) + Kaishi 1.5k (meanings from Jisho at build time). Cards from a known deck with no saved state start
   as passed reviews spread over 2–6 months (`init_known_cards`). Bunpro's N5/N4 lists aren't
   public, so the standard JLPT lists stand in for them.
 - `decks/starter.json`: small word bank.
@@ -92,7 +93,7 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 ## User preferences
 
 - Minimalist dark design, Garamond for Latin text, Klee One for Japanese.
-- Prefers open data sources with attribution (JMdict/Jisho, Tatoeba CC BY 2.0 FR, Kanjium CC BY-SA,
+- Prefers open data sources with attribution (JMdict, bundled offline; Tatoeba CC BY 2.0 FR, Kanjium CC BY-SA,
   JapanesePod101 audio, kanji-data, Leeds frequency list, Kaishi).
 - Testing: the agent can't see or hear everything. Audio playback and real IME typing must be
   checked by the user, and posted mouse clicks don't reach the app unless its window is in front.

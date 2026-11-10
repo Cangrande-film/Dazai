@@ -485,6 +485,8 @@ impl DazaiApp {
         // Rewrites progress.json without the answer history (now in reviews.jsonl).
         app.save();
         app.spawn(|| Msg::Pitch(dict::load_pitch_db()));
+        // Unpack the bundled dictionary in the background so the first search is instant.
+        std::thread::spawn(crate::jmdict::preload);
         app
     }
 
@@ -601,7 +603,7 @@ impl DazaiApp {
                                 self.add.fill(&e);
                                 self.add.status = None;
                             }
-                            None => self.add.status = Some((false, "No matches on Jisho.".into())),
+                            None => self.add.status = Some((false, "No matches in the dictionary.".into())),
                         }
                         self.add.matches = Some(Remote::Ready(v));
                     }
@@ -1824,7 +1826,7 @@ impl DazaiApp {
                                 });
                                 ui.label(
                                     RichText::new(format!(
-                                        "{} use a kanji you've studied, {} only new kanji. Most frequent first (Leeds corpus), checked on Jisho.",
+                                        "{} use a kanji you've studied, {} only new kanji. Most frequent first (Leeds corpus), all in JMdict.",
                                         st.gen_known,
                                         st.gen_total - st.gen_known
                                     ))
@@ -2227,7 +2229,7 @@ impl DazaiApp {
                         });
                     }
 
-                    // More words from Jisho.
+                    // More words from the dictionary.
                     ui.label(RichText::new("More words").small().color(MUTED));
                     let entries: Option<Vec<Entry>> = match self.related.get(&k) {
                         Some(Remote::Ready(v)) => Some(v.iter().filter(|e| e.word != card.word).take(6).cloned().collect()),
@@ -2326,7 +2328,7 @@ impl DazaiApp {
             }
         });
         ui.label(
-            RichText::new("Jisho search: kanji, kana, romaji or English. *学* finds words containing 学.")
+            RichText::new("Search the built-in dictionary (JMdict): kanji, kana, romaji or English. *学* finds words containing 学.")
                 .small()
                 .color(MUTED),
         );
@@ -2360,7 +2362,7 @@ impl DazaiApp {
                     ui.separator();
                 }
                 ui.label(
-                    RichText::new("Data: JMdict via Jisho · audio: JapanesePod101 · pitch: Kanjium")
+                    RichText::new("Dictionary: JMdict (EDRDG, CC BY-SA 4.0), offline · audio: JapanesePod101 · pitch: Kanjium")
                         .small()
                         .color(MUTED.gamma_multiply(0.7)),
                 );
@@ -2498,7 +2500,7 @@ impl DazaiApp {
                         }
                         None => match &entry {
                             Some(Some(_)) => "click to add it to your word bank".to_string(),
-                            Some(None) => "not found on Jisho".to_string(),
+                            Some(None) => "not in the dictionary".to_string(),
                             None => "looking it up…".to_string(),
                         },
                     };
@@ -2561,11 +2563,11 @@ impl DazaiApp {
             self.open_graph_for(i);
         }
         if let Some(w) = pending {
-            self.add.status = Some((false, format!("Still looking up {w} on Jisho, try again in a second.")));
+            self.add.status = Some((false, format!("Still looking up {w}, try again in a second.")));
         }
     }
 
-    /// Looks up the found words on Jisho one after another (politely), for meanings.
+    /// Looks up the found words in the bundled dictionary, for meanings.
     fn fetch_text_meanings(&mut self) {
         let words: Vec<String> = self
             .add
@@ -2585,10 +2587,9 @@ impl DazaiApp {
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
             for w in words {
-                let r = dict::search(&w).map(|v| v.into_iter().find(|e| e.word == w));
+                let r = Ok(crate::jmdict::lookup(&w, None).filter(|e| e.word == w));
                 let _ = tx.send(Msg::TextMeaning(w, r));
                 ctx.request_repaint();
-                std::thread::sleep(Duration::from_millis(120));
             }
         });
     }
@@ -2604,7 +2605,7 @@ impl DazaiApp {
                         .font(FontId::new(20.0, FontFamily::Proportional))
                         .desired_width(220.0),
                 );
-                if ui.button("Autofill from Jisho").clicked() {
+                if ui.button("Autofill").clicked() {
                     autofill = true;
                 }
             });
