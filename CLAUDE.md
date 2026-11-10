@@ -42,7 +42,7 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 
 ## Data
 
-- `decks/known.json` (`"known": true`): 2,091 cards = JLPT N5+N4 (Jisho's JLPT tags, kana words
+- `decks/known.json` (`"known": true`): 2,095 cards = JLPT N5+N4 (Jisho's JLPT tags, kana words
   included) + Kaishi 1.5k (meanings from Jisho at build time). Cards from a known deck with no saved state start
   as passed reviews spread over 2–6 months (`init_known_cards`). Bunpro's N5/N4 lists aren't
   public, so the standard JLPT lists stand in for them.
