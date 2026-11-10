@@ -3787,9 +3787,8 @@ impl DazaiApp {
             let mut known_kanji: HashSet<char> = HashSet::new();
             // A word with several cards (日: ひ / にち) counts once: known if any card is passed.
             let mut word_best: HashMap<&str, Phase> = HashMap::new();
-            // Highest stage group per known word, and per kanji (from the words that use it).
+            // Highest stage group per known word.
             let mut word_group: HashMap<&str, usize> = HashMap::new();
-            let mut kanji_group: HashMap<char, usize> = HashMap::new();
             for (i, c) in self.cards.iter().enumerate() {
                 let phase = states[i].phase;
                 if phase == Phase::Review {
@@ -3797,10 +3796,6 @@ impl DazaiApp {
                     let g = stage_group(srs::stage_of(&states[i], &self.data.settings));
                     let e = word_group.entry(c.word.as_str()).or_insert(g);
                     *e = (*e).max(g);
-                    for k in dict::kanji_of(&c.word) {
-                        let e = kanji_group.entry(k).or_insert(g);
-                        *e = (*e).max(g);
-                    }
                 }
                 let rank = |p: Phase| match p {
                     Phase::Review => 2,
@@ -3826,11 +3821,9 @@ impl DazaiApp {
                 }
             }
             let mut kanji_known = [0usize; 5];
-            let mut kanji_groups = [[0usize; 5]; 5];
             for k in &known_kanji {
                 if let Some(&l) = self.jlpt.kanji_level.get(k) {
                     kanji_known[l] += 1;
-                    kanji_groups[l][kanji_group.get(k).copied().unwrap_or(0)] += 1;
                 }
             }
             egui::Grid::new("jlpt").num_columns(3).spacing([18.0, 8.0]).show(ui, |ui| {
@@ -3845,7 +3838,7 @@ impl DazaiApp {
                     let w = format!("{:.0}%{learning}", pct(words_known[l], self.jlpt.word_totals[l]));
                     stage_progress(ui, word_groups[l], self.jlpt.word_totals[l], &w);
                     let k = format!("{:.0}%", pct(kanji_known[l], self.jlpt.kanji_totals[l]));
-                    stage_progress(ui, kanji_groups[l], self.jlpt.kanji_totals[l], &k);
+                    progress(ui, kanji_known[l], self.jlpt.kanji_totals[l], AMBER, &k);
                     ui.end_row();
                 }
                 // Everything the JLPT covers, N5 to N1 together.
@@ -3862,7 +3855,7 @@ impl DazaiApp {
                     t
                 };
                 stage_progress(ui, sum(&word_groups), wt, &format!("{:.1}% of all JLPT words", pct(wk, wt)));
-                stage_progress(ui, sum(&kanji_groups), kt, &format!("{:.1}% of all JLPT kanji", pct(kk, kt)));
+                progress(ui, kk, kt, AMBER, &format!("{:.1}% of all JLPT kanji", pct(kk, kt)));
                 ui.end_row();
             });
             ui.horizontal_wrapped(|ui| {
@@ -3871,7 +3864,7 @@ impl DazaiApp {
                     ui.label(RichText::new(*name).small().color(MUTED));
                     ui.add_space(6.0);
                 }
-                ui.label(RichText::new("· hover a bar for the counts; a kanji counts at its best word's stage").small().color(MUTED));
+                ui.label(RichText::new("· words by stage; hover a bar for the counts").small().color(MUTED));
             });
             ui.label(
                 RichText::new(format!(
