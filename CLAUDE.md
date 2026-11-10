@@ -86,6 +86,7 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 - **Answer screen**: reading with pitch and audio, meaning, Tatoeba examples, per-kanji block
   ("You've studied" with hover summaries, "More words" from Jisho with Add). Clicking the word
   opens its graph, with a Distance slider for how many shared-kanji steps to show.
+- **Examples on the answer screen**: split into words once per card (`extract::tokenize_with`, ~0.3 ms/sentence, cached in `example_tokens`); words the user has studied are underlined with a hover summary and click-for-graph; the tested word is amber.
 - **Add › From text**: pasted text is shown with words in red (can add) or yellow (in deck);
   hover for a summary, click red to add, click yellow for its graph.
 - **Networking** uses native-tls (schannel): rustls failed because antivirus HTTPS scanning

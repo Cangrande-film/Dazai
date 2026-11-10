@@ -396,6 +396,10 @@ pub struct DazaiApp {
     word_graph: Option<WordGraph>,
     /// The progress file exists but couldn't be read: never save over it.
     save_blocked: bool,
+    /// Example sentences split into words, per card word (computed once, then reused).
+    example_tokens: HashMap<String, Vec<Vec<Token>>>,
+    /// word → card index, rebuilt when the number of cards changes.
+    card_index: (usize, HashMap<String, usize>),
     /// When the random-study stats screen appeared (Enter is ignored for a moment after).
     summary_since: Option<std::time::Instant>,
     drill: Drill,
@@ -454,6 +458,8 @@ impl DazaiApp {
             word_graph: None,
             save_blocked,
             summary_since: None,
+            example_tokens: HashMap::new(),
+            card_index: (0, HashMap::new()),
             drill: Drill::default(),
             session: None,
             session_label: String::new(),
@@ -2104,30 +2110,95 @@ impl DazaiApp {
         }
     }
 
-    /// Example sentences from Tatoeba, with the word highlighted.
+    /// Card index for a word (first card with that spelling).
+    fn card_for_word(&mut self, word: &str) -> Option<usize> {
+        if self.card_index.0 != self.cards.len() {
+            let mut m = HashMap::new();
+            for (i, c) in self.cards.iter().enumerate() {
+                m.entry(c.word.clone()).or_insert(i);
+            }
+            self.card_index = (self.cards.len(), m);
+        }
+        self.card_index.1.get(word).copied()
+    }
+
+    /// Example sentences, with the tested word highlighted and the words you've studied
+    /// underlined: hover one for a summary, click for its graph.
     fn sentences_ui(&mut self, ui: &mut egui::Ui, idx: usize) {
         if !self.data.settings.show_sentences {
             return;
         }
         let word = self.cards[idx].word.clone();
+        let sentences: Option<Vec<Sentence>> = match self.sentences.get(&word) {
+            Some(Remote::Ready(v)) => Some(v.clone()),
+            _ => None,
+        };
+
+        // Split the sentences into words once (about 0.3 ms each), then reuse.
+        if let (Some(v), Remote::Ready(db)) = (&sentences, &self.pitch_db) {
+            if !self.example_tokens.contains_key(&word) {
+                let keep = |w: &str| w.chars().count() >= 2 || w.chars().any(dict::is_kanji);
+                let toks = v.iter().map(|snt| extract::tokenize_with(&snt.jp, db, &keep)).collect();
+                self.example_tokens.insert(word.clone(), toks);
+            }
+        }
+
+        // Pieces to draw: (text, colour, card to summarise on hover).
+        let now = Self::now();
+        let show_pitch = self.data.settings.show_pitch;
+        let mut rendered: Vec<(Vec<(String, Color32, Option<usize>)>, String)> = Vec::new();
+        if let (Some(v), Some(toks)) = (&sentences, self.example_tokens.get(&word).cloned()) {
+            for (snt, tokens) in v.iter().zip(toks) {
+                let target = snt.highlight.clone().unwrap_or_else(|| word.clone());
+                // Character range of the tested word in the sentence.
+                let hl = snt.jp.find(&target).map(|b| {
+                    let start = snt.jp[..b].chars().count();
+                    (start, start + target.chars().count())
+                });
+                let mut pieces = Vec::new();
+                let mut pos = 0;
+                for t in tokens {
+                    let len = t.text.chars().count();
+                    let in_target = hl.is_some_and(|(a, b)| pos < b && pos + len > a);
+                    let card = t
+                        .base
+                        .as_deref()
+                        .and_then(|b| self.card_for_word(b))
+                        .filter(|&i| i != idx && self.state(i).phase != Phase::New);
+                    let color = if in_target {
+                        AMBER
+                    } else if card.is_some() {
+                        Color32::from_rgb(170, 205, 150)
+                    } else {
+                        TEXT
+                    };
+                    pieces.push((t.text, color, card));
+                    pos += len;
+                }
+                rendered.push((pieces, snt.en.clone()));
+            }
+        }
+
         let width = ui.available_width().min(580.0);
         let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+        let mut open_graph = None;
         ui.horizontal(|ui| {
             ui.add_space(margin);
             ui.vertical(|ui| {
                 ui.set_width(width);
                 ui.label(RichText::new("Examples").small().color(MUTED));
-                match self.sentences.get(&word) {
-                    Some(Remote::Loading) | None => {
-                        ui.spinner();
-                    }
-                    Some(Remote::Failed(e)) => {
+                match (self.sentences.get(&word), sentences.as_ref()) {
+                    (Some(Remote::Failed(e)), _) => {
                         ui.label(RichText::new(e).small().color(RED));
                     }
-                    Some(Remote::Ready(v)) if v.is_empty() => {
+                    (_, None) => {
+                        ui.spinner();
+                    }
+                    (_, Some(v)) if v.is_empty() => {
                         ui.label(RichText::new("No example sentences found.").small().color(MUTED));
                     }
-                    Some(Remote::Ready(v)) => {
+                    (_, Some(v)) if rendered.is_empty() => {
+                        // Word list still loading: plain highlighted sentences.
                         for snt in v {
                             let target = snt.highlight.as_deref().unwrap_or(&word);
                             ui.add(egui::Label::new(highlight(&snt.jp, target, 19.0)).wrap());
@@ -2135,9 +2206,71 @@ impl DazaiApp {
                             ui.add_space(6.0);
                         }
                     }
+                    _ => {
+                        let font = FontId::new(19.0, FontFamily::Proportional);
+                        for (pieces, en) in &rendered {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+                                for (text, color, card) in pieces {
+                                    match card {
+                                        None => {
+                                            // One character at a time so lines can wrap anywhere.
+                                            for ch in text.chars() {
+                                                ui.label(RichText::new(ch.to_string()).font(font.clone()).color(*color));
+                                            }
+                                        }
+                                        Some(i) => {
+                                            let c = &self.cards[*i];
+                                            let st = self.state(*i);
+                                            let acc = if show_pitch {
+                                                self.pitch_for(&c.word, &c.readings[0]).and_then(|a| a.first().copied())
+                                            } else {
+                                                None
+                                            };
+                                            let learned = st.phase == Phase::Review;
+                                            let resp = ui
+                                                .add(
+                                                    egui::Label::new(RichText::new(text).font(font.clone()).color(*color).underline())
+                                                        .sense(egui::Sense::click()),
+                                                )
+                                                .on_hover_ui(|ui| {
+                                                    ui.set_max_width(280.0);
+                                                    ui.label(RichText::new(&c.word).font(display_font(26.0)));
+                                                    match acc {
+                                                        Some(a) => {
+                                                            pitch::show(ui, &c.readings[0], a, 17.0, SOFT);
+                                                        }
+                                                        None => {
+                                                            ui.label(RichText::new(&c.readings[0]).size(17.0).color(SOFT));
+                                                        }
+                                                    }
+                                                    ui.add(egui::Label::new(RichText::new(&c.meaning).size(14.0)).wrap());
+                                                    let (status, col) = if learned {
+                                                        (format!("learned · next review in {}", srs::format_secs(st.due - now)), GREEN)
+                                                    } else {
+                                                        ("learning".to_string(), RED)
+                                                    };
+                                                    ui.label(RichText::new(status).small().color(col));
+                                                    ui.label(RichText::new("click for its graph").small().color(MUTED));
+                                                });
+                                            if resp.clicked() {
+                                                open_graph = Some(*i);
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                            ui.add(egui::Label::new(RichText::new(en).size(14.0).color(MUTED)).wrap());
+                            ui.add_space(6.0);
+                        }
+                        ui.label(RichText::new("underlined: words you've studied · hover for a reminder").small().color(MUTED.gamma_multiply(0.8)));
+                    }
                 }
             });
         });
+        if let Some(i) = open_graph {
+            self.open_graph_for(i);
+        }
     }
 
     /// Per kanji: its meaning, words you've already studied with it, and more words to add.

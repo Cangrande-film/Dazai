@@ -82,8 +82,13 @@ pub struct Token {
     pub base: Option<String>,
 }
 
-/// Splits `text` into tokens, longest dictionary match first.
+/// Splits `text` into tokens, longest dictionary match first; words worth a card get a `base`.
 pub fn tokenize(text: &str, db: &PitchDb) -> Vec<Token> {
+    tokenize_with(text, db, &worth_learning)
+}
+
+/// Like `tokenize`, but `keep` decides which dictionary words get a `base`.
+pub fn tokenize_with(text: &str, db: &PitchDb, keep: &dyn Fn(&str) -> bool) -> Vec<Token> {
     let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<Token> = Vec::new();
     let mut plain = String::new();
@@ -110,7 +115,7 @@ pub fn tokenize(text: &str, db: &PitchDb) -> Vec<Token> {
             best = Some((len, run));
         }
         match best {
-            Some((len, base)) if worth_learning(&base) => {
+            Some((len, base)) if keep(&base) => {
                 if !plain.is_empty() {
                     out.push(Token { text: std::mem::take(&mut plain), base: None });
                 }
@@ -188,6 +193,35 @@ mod tests {
         assert!(deinflect("読んでいる").contains(&"読む".to_string()));
         assert!(deinflect("高くない").contains(&"高い".to_string()));
         assert!(deinflect("勉強します").contains(&"勉強".to_string()));
+    }
+
+    /// How long splitting real example sentences takes, with the real word list (if downloaded).
+    /// Run: cargo test --release timing -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn timing() {
+        let Ok(db) = crate::dict::load_pitch_db() else { return };
+        let words = ["食べる", "学校", "勉強", "行く", "見る", "大きい", "新しい", "電車", "友達", "仕事"];
+        let sentences: Vec<String> =
+            words.iter().flat_map(|w| crate::examples::for_word(w, 5)).map(|s| s.jp).collect();
+        let keep = |w: &str| w.chars().count() >= 2 || w.chars().any(is_kanji);
+        let start = std::time::Instant::now();
+        let rounds = 20;
+        let mut n = 0;
+        for _ in 0..rounds {
+            for s in &sentences {
+                n += tokenize_with(s, &db, &keep).len();
+            }
+        }
+        let per = start.elapsed().as_secs_f64() * 1000.0 / (rounds * sentences.len()) as f64;
+        println!("{} sentences, {n} tokens; {per:.3} ms per sentence; 3 sentences = {:.2} ms", sentences.len(), per * 3.0);
+        for s in sentences.iter().take(3) {
+            let t: Vec<String> = tokenize_with(s, &db, &keep)
+                .iter()
+                .map(|t| match &t.base { Some(b) => format!("[{}→{b}]", t.text), None => t.text.clone() })
+                .collect();
+            println!("{}", t.join(""));
+        }
     }
 
     #[test]
