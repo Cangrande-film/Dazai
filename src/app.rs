@@ -429,6 +429,8 @@ pub struct DazaiApp {
     word_graph: Option<WordGraph>,
     /// The progress file exists but couldn't be read: never save over it.
     save_blocked: bool,
+    /// Which example sentence the answer screen shows: (card word, index).
+    example_pos: (String, usize),
     /// Height both Study-page boxes are drawn at (the taller one's natural height).
     menu_card_h: f32,
     /// The card on screen is asked English → Japanese.
@@ -504,6 +506,7 @@ impl DazaiApp {
             reverse: false,
             directions: HashMap::new(),
             menu_card_h: 0.0,
+            example_pos: (String::new(), 0),
             card_index: (0, HashMap::new()),
             drill: Drill::default(),
             session: None,
@@ -2396,7 +2399,38 @@ impl DazaiApp {
             ui.add_space(margin);
             ui.vertical(|ui| {
                 ui.set_width(width);
-                ui.label(RichText::new("Examples").small().color(MUTED));
+                // Carousel: one sentence at a time; ‹ › or the ← → keys switch.
+                let count = sentences.as_ref().map_or(0, |v| v.len());
+                if self.example_pos.0 != word {
+                    self.example_pos = (word.clone(), 0);
+                }
+                if count > 1 && self.word_graph.is_none() {
+                    let (left, right) = ui.input(|i| (i.key_pressed(Key::ArrowLeft), i.key_pressed(Key::ArrowRight)));
+                    if left {
+                        self.example_pos.1 = (self.example_pos.1 + count - 1) % count;
+                    }
+                    if right {
+                        self.example_pos.1 = (self.example_pos.1 + 1) % count;
+                    }
+                }
+                let pos = if count > 0 { self.example_pos.1 % count } else { 0 };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Examples").small().color(MUTED));
+                    if count > 1 {
+                        ui.add_space(6.0);
+                        let arrow = |t: &str| egui::Button::new(RichText::new(t).color(SOFT)).frame(false).small();
+                        if ui.add(arrow("‹")).on_hover_text("Previous (←)").clicked() {
+                            self.example_pos.1 = (pos + count - 1) % count;
+                        }
+                        ui.label(RichText::new(format!("{} / {count}", pos + 1)).small().color(MUTED));
+                        if ui.add(arrow("›")).on_hover_text("Next (→)").clicked() {
+                            self.example_pos.1 = (pos + 1) % count;
+                        }
+                    }
+                });
+                // Room for two lines of Japanese plus the translation, so switching doesn't make
+                // the screen below jump.
+                let sentence_area = |ui: &mut egui::Ui| ui.set_min_height(78.0);
                 match (self.sentences.get(&word), sentences.as_ref()) {
                     (Some(Remote::Failed(e)), _) => {
                         ui.label(RichText::new(e).small().color(RED));
@@ -2408,17 +2442,21 @@ impl DazaiApp {
                         ui.label(RichText::new("No example sentences found.").small().color(MUTED));
                     }
                     (_, Some(v)) if rendered.is_empty() => {
-                        // Word list still loading: plain highlighted sentences.
-                        for snt in v {
-                            let target = snt.highlight.as_deref().unwrap_or(&word);
-                            ui.add(egui::Label::new(highlight(&snt.jp, target, 19.0)).wrap());
-                            ui.add(egui::Label::new(RichText::new(&snt.en).size(14.0).color(MUTED)).wrap());
-                            ui.add_space(6.0);
-                        }
+                        // Word list still loading: plain highlighted sentence.
+                        ui.vertical(|ui| {
+                            sentence_area(ui);
+                            if let Some(snt) = v.get(pos) {
+                                let target = snt.highlight.as_deref().unwrap_or(&word);
+                                ui.add(egui::Label::new(highlight(&snt.jp, target, 19.0)).wrap());
+                                ui.add(egui::Label::new(RichText::new(&snt.en).size(14.0).color(MUTED)).wrap());
+                            }
+                        });
                     }
                     _ => {
                         let font = FontId::new(19.0, FontFamily::Proportional);
-                        for (pieces, en) in &rendered {
+                        ui.vertical(|ui| {
+                        sentence_area(ui);
+                        for (pieces, en) in rendered.iter().skip(pos).take(1) {
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
                                 for (text, color, card) in pieces {
@@ -2471,8 +2509,8 @@ impl DazaiApp {
                                 }
                             });
                             ui.add(egui::Label::new(RichText::new(en).size(14.0).color(MUTED)).wrap());
-                            ui.add_space(6.0);
                         }
+                        });
                         ui.label(RichText::new("underlined: words you've studied · hover for a reminder").small().color(MUTED.gamma_multiply(0.8)));
                     }
                 }
