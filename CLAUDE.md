@@ -66,7 +66,8 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
   Bunpro's stage groups (Beginner/Adept/Seasoned/Expert/Mastered).
 - **Ghost reviews** (Bunpro): a miss in a normal review leaves `CardState.ghost`; ghosts come
   due 1d, 3d, 1w later (`GHOST_HOURS`), are picked after due reviews (`Slot::Ghost`) and only move
-  the ghost, never the stage. A wrong ghost restarts it.
+  the ghost, never the stage. A wrong ghost restarts it. Random study and leech practice
+  (casual sessions) feed ghosts too: a miss starts one, a right answer clears a due ghost step.
 - **Leeches**: words with `lapses >= leech_threshold` (default 4). Tagged while studying, listed
   on the menu (with a casual "Practise leeches" session) and in Stats ("forgive" resets lapses).
 - **Conjugate tab**: drill like wkdonc.github.io/conjugation/drill.html, built only from passed

@@ -1035,6 +1035,16 @@ impl DazaiApp {
     fn grade(&mut self, idx: usize, good: bool) {
         if self.is_casual() {
             self.casual_answer(idx, good);
+            // Casual practice leaves the word's stage alone but still feeds its ghost: a miss
+            // starts one, and a right answer counts as the ghost review if one is due.
+            if self.bunpro() && self.data.settings.ghosts {
+                let ghost_due = self.state(idx).ghost.is_some_and(|g| g.due <= Self::now());
+                if !good {
+                    self.update_ghost(idx, false, true);
+                } else if ghost_due {
+                    self.update_ghost(idx, true, false);
+                }
+            }
             return;
         }
         let bunpro = self.bunpro();
@@ -1258,6 +1268,15 @@ impl DazaiApp {
             };
         }
 
+        // Session name, plus progress for random study / leech practice ("12 left · 7 right").
+        let status = match &self.session {
+            Some(Session::Casual { queue, right, .. }) => {
+                // The card on screen was already taken off the queue.
+                let current = usize::from(matches!(self.study, Study::Asking { .. }));
+                format!("{}  ·  {} left  ·  {} right", self.session_label, queue.len() + current, right)
+            }
+            _ => self.session_label.clone(),
+        };
         // Small tag above the word: why it's being asked.
         let tag = match &self.study {
             Study::Asking { idx, .. } => match (self.slot(), self.is_leech(*idx)) {
@@ -1280,7 +1299,7 @@ impl DazaiApp {
                     ui.add_space(8.0);
                     let msg = match &self.session {
                         Some(Session::Casual { total, right, answered, .. }) => format!(
-                            "Random study done: {total} words, {right} of {answered} answers right. Scheduling wasn't changed."
+                            "Random study done: {total} words, {right} of {answered} answers right. Stages weren't changed; missed words got a ghost review."
                         ),
                         _ if self.bunpro() => match self.next_batch() {
                             Some((t, n)) => format!(
@@ -1313,7 +1332,7 @@ impl DazaiApp {
                 let mut submit = false;
                 let mut quit = false;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&self.session_label).small().color(MUTED));
+                    ui.label(RichText::new(&status).small().color(MUTED));
                     if let Some((t, c)) = tag {
                         ui.label(RichText::new(t).small().color(c));
                     }
@@ -1535,7 +1554,7 @@ impl DazaiApp {
                             ui.add(egui::DragValue::new(&mut st.casual_count).range(1..=passed.max(1) as u32));
                             ui.label(RichText::new(format!("of {passed} passed words in those levels")).color(MUTED));
                         });
-                        ui.label(RichText::new("Casual practice: answers don't change any scheduling.").small().color(MUTED));
+                        ui.label(RichText::new("Casual practice: doesn't change stages or due dates, but misses still leave a ghost review.").small().color(MUTED));
                         ui.add_space(6.0);
                         if ui
                             .add_enabled(passed > 0, egui::Button::new("Start random study").min_size(egui::vec2(180.0, 32.0)))
@@ -1577,7 +1596,7 @@ impl DazaiApp {
                             if ui.add(egui::Button::new("Practise leeches").min_size(egui::vec2(180.0, 32.0))).clicked() {
                                 self.start_leech_session();
                             }
-                            ui.label(RichText::new("Casual practice: doesn't change scheduling.").small().color(MUTED));
+                            ui.label(RichText::new("Casual practice: doesn't change stages, but misses still leave a ghost review.").small().color(MUTED));
                             if let Some(i) = open {
                                 self.open_graph_for(i);
                             }
@@ -1697,7 +1716,7 @@ impl DazaiApp {
                 }
             },
         );
-        let hint = if casual { "1 · Missed      2 / Enter · Got it   (not scheduled)" } else { "1 · Again      2 / Enter · Good" };
+        let hint = if casual { "1 · Missed      2 / Enter · Got it   (stage unchanged; misses leave a ghost)" } else { "1 · Again      2 / Enter · Good" };
         ui.label(RichText::new(hint).small().color(MUTED));
 
         if k1 {
