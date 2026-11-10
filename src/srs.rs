@@ -44,6 +44,15 @@ pub struct Ghost {
     pub step: u8,
 }
 
+/// Where a study session's new words come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NewSource {
+    #[default]
+    None,
+    Bank,
+    Generate,
+}
+
 /// Order in which new cards come out of the word bank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum NewOrder {
@@ -90,6 +99,10 @@ pub struct Settings {
     pub casual_count: u32,
     /// Random study: which levels to draw from (N5, N4, N3, N2, N1, outside JLPT).
     pub casual_levels: [bool; 6],
+    pub new_source: NewSource,
+    /// Random study against the clock.
+    pub casual_timed: bool,
+    pub casual_minutes: u32,
 }
 
 impl Default for Settings {
@@ -117,6 +130,9 @@ impl Default for Settings {
             gen_known: 7,
             casual_count: 20,
             casual_levels: [true; 6],
+            new_source: NewSource::None,
+            casual_timed: false,
+            casual_minutes: 5,
         }
     }
 }

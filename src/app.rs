@@ -6,7 +6,7 @@ use crate::extract::{self, Found, Token};
 use crate::levels::{Jlpt, LEVELS};
 use crate::graph::{self, Graph, GraphWord};
 use crate::pitch;
-use crate::srs::{self, CardState, CheckMode, Grade, NewOrder, Phase, Scheduler, Settings};
+use crate::srs::{self, CardState, CheckMode, Grade, NewOrder, NewSource, Phase, Scheduler, Settings};
 use crate::storage::{self, Card, ReviewLog, SaveData};
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use eframe::egui::{self, Color32, FontFamily, FontId, Key, RichText};
@@ -91,6 +91,8 @@ enum Session {
         retry: VecDeque<usize>,
         /// Where the card on screen came from.
         slot: Slot,
+        /// Due reviews (and ghosts) still to do this session.
+        reviews_left: usize,
     },
     /// Casual review of passed cards; nothing is scheduled.
     Casual {
@@ -101,6 +103,8 @@ enum Session {
         results: Vec<(usize, bool)>,
         /// Unix seconds when the session started.
         started: i64,
+        /// Timed random study: the session ends at this time, and misses don't come back.
+        deadline: Option<i64>,
     },
 }
 
@@ -395,6 +399,11 @@ pub struct DazaiApp {
     session: Option<Session>,
     session_label: String,
     bank_count: u32,
+    /// Reviews to do in the next session; follows the due count until the user changes it.
+    review_count: u32,
+    review_count_auto: bool,
+    /// Review limit for a session waiting on generated words.
+    pending_reviews: usize,
     sentences: HashMap<String, Remote<Vec<Sentence>>>,
     gen: GenState,
     /// "Add as priority" toggle shared by Browse, Add and From-text.
@@ -440,6 +449,9 @@ impl DazaiApp {
             session: None,
             session_label: String::new(),
             bank_count: 0,
+            review_count: 0,
+            review_count_auto: true,
+            pending_reviews: 0,
             sentences: HashMap::new(),
             gen: GenState::default(),
             add_priority: false,
@@ -806,9 +818,15 @@ impl DazaiApp {
         let states: Vec<CardState> = (0..self.cards.len()).map(|i| self.state(i)).collect();
         match &mut self.session {
             None => None,
-            Some(Session::Casual { queue, .. }) => queue.pop_front(),
-            Some(Session::Srs { new_queue, retry, slot }) => {
+            Some(Session::Casual { queue, deadline, .. }) => {
+                if deadline.is_some_and(|d| now >= d) {
+                    return None;
+                }
+                queue.pop_front()
+            }
+            Some(Session::Srs { new_queue, retry, slot, reviews_left }) => {
                 *slot = Slot::Normal;
+                let more_reviews = *reviews_left > 0;
                 let earliest = |pred: &dyn Fn(&CardState) -> bool| {
                     states
                         .iter()
@@ -822,7 +840,7 @@ impl DazaiApp {
                     new_queue.pop_front();
                 }
                 let next = earliest(&|s| learning(s) && s.due <= now)
-                    .or_else(|| earliest(&|s| s.phase == Phase::Review && s.due <= day_end));
+                    .or_else(|| more_reviews.then(|| earliest(&|s| s.phase == Phase::Review && s.due <= day_end)).flatten());
                 if next.is_some() {
                     return next;
                 }
@@ -833,7 +851,7 @@ impl DazaiApp {
                     .filter(|(i, s)| s.ghost.is_some_and(|g| g.due <= now) && !retry.contains(i))
                     .min_by_key(|(_, s)| s.ghost.map(|g| g.due))
                     .map(|(i, _)| i);
-                if ghosts_on && ghost.is_some() {
+                if ghosts_on && more_reviews && ghost.is_some() {
                     *slot = Slot::Ghost;
                     return ghost;
                 }
@@ -853,9 +871,32 @@ impl DazaiApp {
         matches!(self.session, Some(Session::Casual { .. }))
     }
 
+    /// Starts an SRS session: up to `reviews` due reviews (ghosts included) plus these new words.
+    fn start_session(&mut self, new_words: Vec<usize>, reviews: usize, label: String) {
+        self.session_label = label;
+        self.session = Some(Session::Srs {
+            new_queue: new_words.into(),
+            retry: VecDeque::new(),
+            slot: Slot::Normal,
+            reviews_left: reviews,
+        });
+        self.review_count_auto = true;
+        self.save();
+        self.study = Study::Pick;
+    }
+
+    /// "12 reviews + 5 new", "12 reviews", "5 new".
+    fn session_name(reviews: usize, new: usize, kind: &str) -> String {
+        match (reviews, new) {
+            (r, 0) => format!("{r} reviews"),
+            (0, n) => format!("{n} {kind}"),
+            (r, n) => format!("{r} reviews + {n} {kind}"),
+        }
+    }
+
     /// Starts an SRS session: due cards plus `new` cards from the word bank
     /// (priority cards first, then in the chosen order).
-    fn start_bank_session(&mut self, new: usize) {
+    fn start_bank_session(&mut self, new: usize, reviews: usize) {
         let bank = self.bank();
         let (mut prio, mut rest): (Vec<usize>, Vec<usize>) = bank.into_iter().partition(|&i| self.cards[i].priority);
         if self.data.settings.new_order == NewOrder::Random {
@@ -864,10 +905,8 @@ impl DazaiApp {
         }
         prio.extend(rest);
         prio.truncate(new);
-        self.session_label = if prio.is_empty() { "Reviews".into() } else { format!("Reviews + {} new", prio.len()) };
-        self.session = Some(Session::Srs { new_queue: prio.into(), retry: VecDeque::new(), slot: Slot::Normal });
-        self.save();
-        self.study = Study::Pick;
+        let label = Self::session_name(reviews, prio.len(), "new");
+        self.start_session(prio, reviews, label);
     }
 
     /// JLPT level index (0 = N5 … 4 = N1), or 5 for words outside the JLPT lists.
@@ -898,6 +937,25 @@ impl DazaiApp {
             answered: 0,
             results: Vec::new(),
             started: Self::now(),
+            deadline: None,
+        });
+        self.save();
+        self.study = Study::Pick;
+    }
+
+    /// Timed random study: random passed words until `minutes` run out.
+    fn start_timed(&mut self, minutes: u32) {
+        let mut pool = self.casual_pool();
+        self.shuffle(&mut pool);
+        let minutes = minutes.clamp(1, 60);
+        self.session_label = format!("Timed random study · {minutes} min");
+        self.session = Some(Session::Casual {
+            queue: pool.into(),
+            right: 0,
+            answered: 0,
+            results: Vec::new(),
+            started: Self::now(),
+            deadline: Some(Self::now() + minutes as i64 * 60),
         });
         self.save();
         self.study = Study::Pick;
@@ -938,10 +996,12 @@ impl DazaiApp {
             }
         }
         self.shuffle(&mut idxs);
-        self.session_label = format!("Reviews + {} generated", idxs.len());
-        self.session = Some(Session::Srs { new_queue: idxs.into(), retry: VecDeque::new(), slot: Slot::Normal });
+        let reviews = self.pending_reviews;
+        let label = Self::session_name(reviews, idxs.len(), "generated");
         self.gen.status.clear();
-        if self.screen == Screen::Study {
+        let screen = self.screen;
+        self.start_session(idxs, reviews, label);
+        if screen != Screen::Study {
             self.study = Study::Pick;
         }
     }
@@ -1047,6 +1107,7 @@ impl DazaiApp {
             answered: 0,
             results: Vec::new(),
             started: Self::now(),
+            deadline: None,
         });
         self.study = Study::Pick;
     }
@@ -1087,6 +1148,12 @@ impl DazaiApp {
         }
         let bunpro = self.bunpro();
         let slot = self.slot();
+        let was_review = self.state(idx).phase == Phase::Review;
+        if slot == Slot::Ghost || (slot == Slot::Normal && was_review) {
+            if let Some(Session::Srs { reviews_left, .. }) = &mut self.session {
+                *reviews_left = reviews_left.saturating_sub(1);
+            }
+        }
         match slot {
             Slot::Normal => self.answer(idx, if good { Grade::Good } else { Grade::Again }),
             Slot::Retry if !bunpro => self.answer(idx, if good { Grade::Good } else { Grade::Again }),
@@ -1117,8 +1184,8 @@ impl DazaiApp {
 
     /// End of a random study / leech practice session: how it went, overall and by level and type.
     fn casual_summary_ui(&mut self, ui: &mut egui::Ui, enter: bool) {
-        let Some(Session::Casual { results, started, .. }) = &self.session else { return };
-        let (results, started) = (results.clone(), *started);
+        let Some(Session::Casual { results, started, deadline, .. }) = &self.session else { return };
+        let (results, started, timed) = (results.clone(), *started, deadline.is_some());
         // Each word's first answer decides "right first try" vs "missed".
         let mut seen = HashSet::new();
         let first: Vec<(usize, bool)> = results.iter().copied().filter(|(i, _)| seen.insert(*i)).collect();
@@ -1126,7 +1193,11 @@ impl DazaiApp {
         let right_first = first.iter().filter(|(_, g)| *g).count();
         let missed: Vec<usize> = first.iter().filter(|(_, g)| !*g).map(|(i, _)| *i).collect();
         let answers = results.len();
-        let secs = (Self::now() - started).max(0);
+        let end = match &self.session {
+            Some(Session::Casual { deadline: Some(d), .. }) => Self::now().min(*d),
+            _ => Self::now(),
+        };
+        let secs = (end - started).max(0);
         let pct = |n: usize, d: usize| if d == 0 { "–".to_string() } else { format!("{:.0}%", n as f64 * 100.0 / d as f64) };
 
         let mut by_level = [(0usize, 0usize); 6]; // (words, right first try)
@@ -1216,8 +1287,13 @@ impl DazaiApp {
                         if ui.add(egui::Button::new("Back to menu").min_size(egui::vec2(150.0, 34.0))).clicked() || enter {
                             back = true;
                         }
+                        let again_label = if timed {
+                            format!("Review the {} failed (no time limit)", missed.len())
+                        } else {
+                            format!("Practise the {} missed", missed.len())
+                        };
                         if !missed.is_empty()
-                            && ui.add(egui::Button::new(format!("Practise the {} missed", missed.len())).min_size(egui::vec2(190.0, 34.0))).clicked()
+                            && ui.add(egui::Button::new(again_label).min_size(egui::vec2(190.0, 34.0))).clicked()
                         {
                             again = Some(missed.clone());
                         }
@@ -1238,6 +1314,7 @@ impl DazaiApp {
                 answered: 0,
                 results: Vec::new(),
                 started: Self::now(),
+                deadline: None,
             });
             self.study = Study::Pick;
         } else if back {
@@ -1248,12 +1325,12 @@ impl DazaiApp {
 
     /// Casual mode: missed cards come back at the end of the queue; nothing is scheduled.
     fn casual_answer(&mut self, idx: usize, good: bool) {
-        if let Some(Session::Casual { queue, right, answered, results, .. }) = &mut self.session {
+        if let Some(Session::Casual { queue, right, answered, results, deadline, .. }) = &mut self.session {
             *answered += 1;
             results.push((idx, good));
             if good {
                 *right += 1;
-            } else {
+            } else if deadline.is_none() {
                 queue.push_back(idx);
             }
         }
@@ -1438,12 +1515,24 @@ impl DazaiApp {
             };
         }
 
+        // Timed random study: when time is up, the unanswered word on screen is dropped.
+        if let Some(Session::Casual { deadline: Some(d), .. }) = &self.session {
+            if Self::now() >= *d && matches!(self.study, Study::Asking { .. }) {
+                self.study = Study::Done;
+            } else {
+                ui.ctx().request_repaint_after(Duration::from_millis(500));
+            }
+        }
         if matches!(self.study, Study::Done) && self.is_casual() {
             self.casual_summary_ui(ui, enter);
             return;
         }
         // Session name, plus progress for random study / leech practice ("12 left · 7 right").
         let status = match &self.session {
+            Some(Session::Casual { deadline: Some(d), answered, right, .. }) => {
+                let left = (d - Self::now()).max(0);
+                format!("{}  ·  {}:{:02} left  ·  {} right of {}", self.session_label, left / 60, left % 60, right, answered)
+            }
             Some(Session::Casual { queue, right, .. }) => {
                 // The card on screen was already taken off the queue.
                 let current = usize::from(matches!(self.study, Study::Asking { .. }));
@@ -1471,7 +1560,10 @@ impl DazaiApp {
                     ui.add_space((avail * 0.22).max(20.0));
                     ui.label(RichText::new("お疲れさま").font(display_font(44.0)));
                     ui.add_space(8.0);
+                    let (_, learn_left, review_left) = self.counts();
+                    let still_due = review_left + learn_left + self.ghosts_due();
                     let msg = match &self.session {
+                        _ if still_due > 0 => format!("Session done. {still_due} more reviews are due; start another session for them."),
                         _ if self.bunpro() => match self.next_batch() {
                             Some((t, n)) => format!(
                                 "Session done. Next reviews: {n} at {}.",
@@ -1620,74 +1712,95 @@ impl DazaiApp {
                             .inner_margin(egui::Margin::symmetric(16, 14))
                     };
 
-                    // 1. Reviews + word bank
+                    // 1. Study session: reviews, plus optional new words (word bank or generated)
+                    let due = review + learn + self.ghosts_due();
+                    if self.review_count_auto {
+                        self.review_count = due as u32;
+                    }
+                    self.review_count = self.review_count.min(due as u32);
                     card_frame().show(ui, |ui| {
                         ui.set_width(width - 32.0);
-                        ui.label(RichText::new("Reviews + word bank").size(17.0));
+                        ui.label(RichText::new("Study session").size(17.0));
                         ui.add_space(4.0);
+                        row(ui, |ui| {
+                            ui.label("Reviews");
+                            if ui.add(egui::DragValue::new(&mut self.review_count).range(0..=due as u32)).changed() {
+                                self.review_count_auto = false;
+                            }
+                            ui.label(RichText::new(format!("of {due} due")).color(MUTED));
+                            if !self.review_count_auto && ui.add(egui::Button::new(RichText::new("all").small().color(MUTED)).frame(false)).clicked() {
+                                self.review_count_auto = true;
+                            }
+                        });
                         row(ui, |ui| {
                             ui.label("New words");
-                            self.bank_count = self.bank_count.min(bank.len() as u32);
-                            ui.add(egui::DragValue::new(&mut self.bank_count).range(0..=bank.len() as u32));
-                            let p = if prio > 0 { format!(" ({prio} flagged priority)") } else { String::new() };
-                            ui.label(RichText::new(format!("of {}{p}", bank.len())).color(MUTED));
+                            let st = &mut self.data.settings;
+                            ui.radio_value(&mut st.new_source, NewSource::None, "none");
+                            ui.radio_value(&mut st.new_source, NewSource::Bank, format!("from the word bank ({})", bank.len()));
+                            ui.radio_value(&mut st.new_source, NewSource::Generate, "generate");
                         });
-                        row(ui, |ui| {
-                            ui.label("Order");
-                            ui.radio_value(&mut self.data.settings.new_order, NewOrder::Added, "as added");
-                            ui.radio_value(&mut self.data.settings.new_order, NewOrder::Random, "random");
-                            ui.label(RichText::new("· priority words always come first").small().color(MUTED));
-                        });
-                        ui.add_space(6.0);
-                        let due = review + learn + self.ghosts_due();
-                        let label = if self.bank_count == 0 {
-                            format!("Start: {due} reviews")
-                        } else {
-                            format!("Start: {due} reviews + {} new", self.bank_count)
-                        };
-                        if ui.add(egui::Button::new(label).min_size(egui::vec2(180.0, 32.0))).clicked() {
-                            let n = self.bank_count as usize;
-                            self.start_bank_session(n);
+                        let source = self.data.settings.new_source;
+                        match source {
+                            NewSource::None => {}
+                            NewSource::Bank => {
+                                row(ui, |ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("How many");
+                                    self.bank_count = self.bank_count.min(bank.len() as u32);
+                                    ui.add(egui::DragValue::new(&mut self.bank_count).range(0..=bank.len() as u32));
+                                    let p = if prio > 0 { format!(" ({prio} flagged priority)") } else { String::new() };
+                                    ui.label(RichText::new(format!("of {}{p}", bank.len())).color(MUTED));
+                                });
+                                row(ui, |ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("Order");
+                                    ui.radio_value(&mut self.data.settings.new_order, NewOrder::Added, "as added");
+                                    ui.radio_value(&mut self.data.settings.new_order, NewOrder::Random, "random");
+                                    ui.label(RichText::new("· priority words first").small().color(MUTED));
+                                });
+                            }
+                            NewSource::Generate => {
+                                let st = &mut self.data.settings;
+                                row(ui, |ui| {
+                                    ui.add_space(16.0);
+                                    ui.label("Words");
+                                    ui.add(egui::DragValue::new(&mut st.gen_total).range(1..=50));
+                                    ui.add_space(10.0);
+                                    ui.label("with a kanji you know");
+                                    st.gen_known = st.gen_known.min(st.gen_total);
+                                    ui.add(egui::DragValue::new(&mut st.gen_known).range(0..=st.gen_total));
+                                });
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} use a kanji you've studied, {} only new kanji. Most frequent first (Leeds corpus), checked on Jisho.",
+                                        st.gen_known,
+                                        st.gen_total - st.gen_known
+                                    ))
+                                    .small()
+                                    .color(MUTED),
+                                );
+                            }
                         }
-                    });
-                    ui.add_space(10.0);
-
-                    // 2. Generated session
-                    card_frame().show(ui, |ui| {
-                        ui.set_width(width - 32.0);
-                        ui.label(RichText::new("Generate new words").size(17.0));
-                        ui.add_space(4.0);
-                        let st = &mut self.data.settings;
-                        row(ui, |ui| {
-                            ui.label("Words");
-                            ui.add(egui::DragValue::new(&mut st.gen_total).range(1..=50));
-                            ui.add_space(10.0);
-                            ui.label("with a kanji you know");
-                            st.gen_known = st.gen_known.min(st.gen_total);
-                            ui.add(egui::DragValue::new(&mut st.gen_known).range(0..=st.gen_total));
-                        });
-                        ui.label(
-                            RichText::new(format!(
-                                "{} will use a kanji you've studied; {} will use only kanji that are new to you.",
-                                st.gen_known,
-                                st.gen_total - st.gen_known
-                            ))
-                            .small()
-                            .color(MUTED),
-                        );
-                        ui.label(
-                            RichText::new("Most frequent words first (Leeds internet corpus), checked on Jisho. Your reviews are included.")
-                                .small()
-                                .color(MUTED),
-                        );
                         ui.add_space(6.0);
+                        let reviews = self.review_count as usize;
+                        let new = match source {
+                            NewSource::None => 0,
+                            NewSource::Bank => self.bank_count as usize,
+                            NewSource::Generate => self.data.settings.gen_total as usize,
+                        };
+                        let kind = if source == NewSource::Generate { "generated" } else { "new" };
+                        let label = format!("Start: {}", Self::session_name(reviews, new, kind));
                         row(ui, |ui| {
-                            let btn = ui.add_enabled(
-                                !self.gen.running,
-                                egui::Button::new("Generate session").min_size(egui::vec2(180.0, 32.0)),
-                            );
-                            if btn.clicked() {
-                                self.start_generation();
+                            let ready = (reviews > 0 || new > 0) && !self.gen.running;
+                            if ui.add_enabled(ready, egui::Button::new(label).min_size(egui::vec2(200.0, 32.0))).clicked() {
+                                match source {
+                                    NewSource::Generate => {
+                                        self.pending_reviews = reviews;
+                                        self.start_generation();
+                                    }
+                                    NewSource::Bank => self.start_bank_session(new, reviews),
+                                    NewSource::None => self.start_bank_session(0, reviews),
+                                }
                             }
                             if self.gen.running {
                                 ui.spinner();
@@ -1719,20 +1832,49 @@ impl DazaiApp {
                             }
                         });
                         row(ui, |ui| {
-                            ui.label("Words");
                             let st = &mut self.data.settings;
-                            st.casual_count = st.casual_count.clamp(1, passed.max(1) as u32);
-                            ui.add(egui::DragValue::new(&mut st.casual_count).range(1..=passed.max(1) as u32));
-                            ui.label(RichText::new(format!("of {passed} passed words in those levels")).color(MUTED));
+                            ui.radio_value(&mut st.casual_timed, false, "set number of words");
+                            ui.radio_value(&mut st.casual_timed, true, "timed");
                         });
+                        row(ui, |ui| {
+                            let st = &mut self.data.settings;
+                            if st.casual_timed {
+                                ui.label("Minutes");
+                                ui.add(egui::DragValue::new(&mut st.casual_minutes).range(1..=60));
+                                ui.label(
+                                    RichText::new(format!("random words from {passed} passed, until time runs out"))
+                                        .color(MUTED),
+                                );
+                            } else {
+                                ui.label("Words");
+                                st.casual_count = st.casual_count.clamp(1, passed.max(1) as u32);
+                                ui.add(egui::DragValue::new(&mut st.casual_count).range(1..=passed.max(1) as u32));
+                                ui.label(RichText::new(format!("of {passed} passed words in those levels")).color(MUTED));
+                            }
+                        });
+                        if self.data.settings.casual_timed {
+                            ui.label(
+                                RichText::new("Missed words don't come back during the run; afterwards you can go over them without a time limit.")
+                                    .small()
+                                    .color(MUTED),
+                            );
+                        }
                         ui.label(RichText::new("Casual practice: doesn't change stages or due dates, but misses still leave a ghost review.").small().color(MUTED));
                         ui.add_space(6.0);
-                        if ui
-                            .add_enabled(passed > 0, egui::Button::new("Start random study").min_size(egui::vec2(180.0, 32.0)))
-                            .clicked()
-                        {
-                            let n = self.data.settings.casual_count as usize;
-                            self.start_casual(n);
+                        let timed = self.data.settings.casual_timed;
+                        let label = if timed {
+                            format!("Start timed study ({} min)", self.data.settings.casual_minutes)
+                        } else {
+                            "Start random study".to_string()
+                        };
+                        if ui.add_enabled(passed > 0, egui::Button::new(label).min_size(egui::vec2(200.0, 32.0))).clicked() {
+                            if timed {
+                                let m = self.data.settings.casual_minutes;
+                                self.start_timed(m);
+                            } else {
+                                let n = self.data.settings.casual_count as usize;
+                                self.start_casual(n);
+                            }
                         }
                     });
                     // 4. Leeches

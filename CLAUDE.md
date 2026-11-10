@@ -56,10 +56,13 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 
 ## Behaviour worth knowing
 
-- **Study menu**: (1) due reviews + N new words from the word bank (as added or random; priority
-  cards first), (2) generate N new words from the frequency list, K of them sharing a kanji the
-  user knows, each confirmed on Jisho, (3) random study of passed cards, filterable by JLPT
-  level / "other", which never changes scheduling.
+- **Study menu**: (1) "Study session": choose how many due reviews to do (all by default,
+  ghosts included; `Session::Srs.reviews_left`), plus optional new words from the word bank (as
+  added or random; priority first) or generated (N words from the frequency list, K sharing a
+  known kanji, confirmed on Jisho). (2) Random study of passed cards, filterable by JLPT level /
+  "other": a set number of words, or timed (1–60 min, `Session::Casual.deadline`; misses don't come back
+  during the run, the end screen offers to review them untimed). Casual sessions never change
+  stages but do feed ghosts, and end with a stats summary. (3) Leeches.
 - **Bunpro-style sessions**: reviews due now (hourly batches), then new words; a missed word
   goes into the session's `retry` queue and comes back until answered right, and only its first
   answer changes the stage. Menu shows the next batch; Stats has an hourly 24h forecast and
