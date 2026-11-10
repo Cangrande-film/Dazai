@@ -402,6 +402,8 @@ pub struct DazaiApp {
     card_index: (usize, HashMap<String, usize>),
     /// When the random-study stats screen appeared (Enter is ignored for a moment after).
     summary_since: Option<std::time::Instant>,
+    /// Unix time the random-study session ended (the stats screen's clock stops here).
+    summary_end: Option<i64>,
     drill: Drill,
 
     session: Option<Session>,
@@ -458,6 +460,7 @@ impl DazaiApp {
             word_graph: None,
             save_blocked,
             summary_since: None,
+            summary_end: None,
             example_tokens: HashMap::new(),
             card_index: (0, HashMap::new()),
             drill: Drill::default(),
@@ -1250,9 +1253,10 @@ impl DazaiApp {
         let right_first = first.iter().filter(|(_, g)| *g).count();
         let missed: Vec<usize> = first.iter().filter(|(_, g)| !*g).map(|(i, _)| *i).collect();
         let answers = results.len();
+        let ended = *self.summary_end.get_or_insert_with(Self::now);
         let end = match &self.session {
-            Some(Session::Casual { deadline: Some(d), .. }) => Self::now().min(*d),
-            _ => Self::now(),
+            Some(Session::Casual { deadline: Some(d), .. }) => ended.min(*d),
+            _ => ended,
         };
         let secs = (end - started).max(0);
         let pct = |n: usize, d: usize| if d == 0 { "–".to_string() } else { format!("{:.0}%", n as f64 * 100.0 / d as f64) };
@@ -1367,6 +1371,7 @@ impl DazaiApp {
         }
         if again.is_some() || back {
             self.summary_since = None;
+            self.summary_end = None;
         }
         if let Some(list) = again {
             let total = list.len();
@@ -2036,7 +2041,15 @@ impl DazaiApp {
         if !card.notes.is_empty() {
             ui.label(RichText::new(&card.notes).small().color(MUTED));
         }
-        ui.add_space(24.0);
+        ui.add_space(4.0);
+        if ui
+            .add(egui::Button::new(RichText::new("See graph").small().color(BLUE)).frame(false))
+            .on_hover_text("Words linked to this one through shared kanji")
+            .clicked()
+        {
+            self.open_graph_for(idx);
+        }
+        ui.add_space(20.0);
 
         let overlay = self.word_graph.is_some();
         let (space, k1, k2) = ui.input(|i| {
