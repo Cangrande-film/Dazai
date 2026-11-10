@@ -22,6 +22,9 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Dazai")
             .with_inner_size([1040.0, 740.0])
+            .with_icon(std::sync::Arc::new(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default(),
+            ))
             .with_min_inner_size([760.0, 520.0]),
         ..Default::default()
     };

@@ -10,7 +10,8 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn play(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+    /// Plays at `volume` (0.0–1.0).
+    pub fn play(&mut self, bytes: Vec<u8>, volume: f32) -> Result<(), String> {
         if self.out.is_none() {
             self.out = Some(rodio::OutputStream::try_default().map_err(|e| e.to_string())?);
         }
@@ -20,6 +21,7 @@ impl Player {
         }
         let sink = rodio::Sink::try_new(handle).map_err(|e| e.to_string())?;
         let source = rodio::Decoder::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+        sink.set_volume(volume.clamp(0.0, 1.0));
         sink.append(source);
         self.sink = Some(sink);
         Ok(())

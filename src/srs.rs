@@ -86,6 +86,8 @@ pub struct Settings {
     pub learn_ahead_minutes: u32,
     /// Play the native recording when the answer is revealed.
     pub autoplay_audio: bool,
+    /// Recording volume, 0–100 (0 = silent).
+    pub volume: u32,
     pub show_pitch: bool,
     pub show_sentences: bool,
     /// Bunpro-style ghost reviews after a miss.
@@ -127,6 +129,7 @@ impl Default for Settings {
             max_interval: 36_500,
             learn_ahead_minutes: 20,
             autoplay_audio: true,
+            volume: 80,
             show_pitch: true,
             show_sentences: true,
             ghosts: true,

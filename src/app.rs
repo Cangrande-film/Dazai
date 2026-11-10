@@ -752,7 +752,11 @@ impl DazaiApp {
     }
 
     fn play_bytes(&mut self, bytes: Vec<u8>) {
-        if let Err(e) = self.player.play(bytes) {
+        let volume = self.data.settings.volume.min(100) as f32 / 100.0;
+        if volume <= 0.0 {
+            return; // silent
+        }
+        if let Err(e) = self.player.play(bytes, volume) {
             self.messages.push(format!("Audio: {e}"));
         }
     }
@@ -1559,7 +1563,7 @@ impl DazaiApp {
     fn on_reveal(&mut self, idx: usize) {
         let card = self.cards[idx].clone();
         self.request_sentences(&card.word);
-        if self.data.settings.autoplay_audio {
+        if self.data.settings.autoplay_audio && self.data.settings.volume > 0 {
             self.request_audio(&card.word, &card.readings[0], true);
         }
         let ks = dict::kanji_of(&card.word);
@@ -1700,6 +1704,22 @@ impl DazaiApp {
                         if ui.add(egui::Button::new(text).frame(false)).clicked() {
                             self.screen = Screen::Settings;
                             self.draft = Some(SettingsDraft::from(&self.data.settings));
+                        }
+                        ui.add_space(10.0);
+                        // Recording volume; 0% = silent (no autoplay either).
+                        let vol = &mut self.data.settings.volume;
+                        let resp = ui
+                            .scope(|ui| {
+                                ui.spacing_mut().slider_width = 80.0;
+                                ui.spacing_mut().interact_size.y = 18.0;
+                                ui.add(egui::Slider::new(vol, 0..=100).show_value(false))
+                            })
+                            .inner
+                            .on_hover_text("Audio volume (0 = silent, no autoplay)");
+                        let label = if *vol == 0 { "muted".to_string() } else { format!("vol {vol}%") };
+                        ui.label(RichText::new(label).small().color(MUTED));
+                        if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                            self.save();
                         }
                         if self.screen == Screen::Study && !self.cards.is_empty() {
                             let (n, l, r) = self.counts();

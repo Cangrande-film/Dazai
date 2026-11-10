@@ -38,7 +38,8 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 | `src/pitch.rs` | Draws readings with their pitch-accent line. |
 | `src/graph.rs` | Force-directed word graph (spatial-grid repulsion) used by the per-word graph overlay. |
 | `src/levels.rs` | JLPT word/kanji level table compiled in from `data/jlpt.json`. |
-| `src/audio.rs` | rodio MP3 playback. |
+| `src/audio.rs` | rodio MP3 playback at `settings.volume` (top-bar slider; 0 = silent, no autoplay). |
+| `build.rs` | Embeds `assets/dazai.ico` (portrait of Osamu Dazai) as the exe icon via winresource (needs the Windows SDK's rc.exe; failure is only a warning). The window icon is `assets/icon.png`. |
 
 ## Data
 
