@@ -15,6 +15,11 @@ fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace() && *c != '\u{3000}').collect()
 }
 
+/// Input without spaces and with katakana turned into hiragana (kanji left as they are).
+pub fn normalize(s: &str) -> String {
+    clean(s).chars().map(kata_to_hira).collect()
+}
+
 fn kata_to_hira(c: char) -> char {
     match c {
         '\u{30A1}'..='\u{30F6}' => char::from_u32(c as u32 - 0x60).unwrap_or(c),

@@ -1,5 +1,6 @@
 use crate::audio::Player;
 use crate::check::{self, Verdict};
+use crate::conjugate::{self as conj, Class, Form, Kind, Pair, Word, KINDS};
 use crate::dict::{self, Entry, KanjiInfo, PitchDb, Sentence};
 use crate::extract::{self, Found, Token};
 use crate::levels::{Jlpt, LEVELS};
@@ -35,6 +36,7 @@ enum Screen {
     Study,
     Browse,
     Add,
+    Conjugate,
     Stats,
     Settings,
 }
@@ -69,6 +71,17 @@ enum Msg {
     TextMeaning(String, Result<Option<Entry>, String>),
 }
 
+/// Why the card on screen is being asked.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// A due review or a new word: answering it moves its SRS stage.
+    Normal,
+    /// A word missed earlier this session (doesn't reschedule).
+    Retry,
+    /// A ghost review after a recent miss (only moves the ghost).
+    Ghost,
+}
+
 /// What the current study session draws from.
 enum Session {
     /// Due reviews and learning cards, plus these new cards (indexes into `cards`).
@@ -76,8 +89,8 @@ enum Session {
         new_queue: VecDeque<usize>,
         /// Bunpro-style: missed words come back this session until answered right.
         retry: VecDeque<usize>,
-        /// The card on screen came from `retry` (answering it doesn't reschedule).
-        retrying: bool,
+        /// Where the card on screen came from.
+        slot: Slot,
     },
     /// Casual review of passed cards; nothing is scheduled.
     Casual { queue: VecDeque<usize>, total: usize, right: usize, answered: usize },
@@ -111,6 +124,71 @@ struct WordGraph {
     distance: usize,
     studied_only: bool,
     graph: Graph,
+}
+
+/// Conjugation drill (like Don's Japanese Conjugation Drill), on words you've learned.
+struct Drill {
+    count: u32,
+    /// Enabled forms, in KINDS order.
+    kinds: [bool; 9],
+    polite: bool,
+    negative: bool,
+    past: bool,
+    /// Enabled word groups, in DRILL_GROUPS order.
+    groups: [bool; 7],
+    trick: bool,
+    furigana: bool,
+    run: Option<DrillRun>,
+}
+
+impl Default for Drill {
+    fn default() -> Self {
+        Drill {
+            count: 10,
+            kinds: [true, false, false, false, false, false, false, false, false],
+            polite: true,
+            negative: true,
+            past: true,
+            groups: [true, true, true, true, true, false, false],
+            trick: true,
+            furigana: true,
+            run: None,
+        }
+    }
+}
+
+const DRILL_GROUPS: [&str; 7] =
+    ["Godan verbs", "Ichidan verbs", "する verbs", "来る", "行く, ある, くださる…", "い adjectives (+ いい)", "な adjectives"];
+
+fn drill_group(c: Class) -> usize {
+    match c {
+        Class::Godan => 0,
+        Class::Ichidan => 1,
+        Class::Suru => 2,
+        Class::Kuru => 3,
+        Class::Iku | Class::Aru | Class::Honorific => 4,
+        Class::IAdj | Class::Ii => 5,
+        Class::NaAdj => 6,
+    }
+}
+
+#[derive(Clone)]
+struct Question {
+    word: Word,
+    from: Form,
+    shown: Pair,
+    to: Form,
+    answers: Vec<Pair>,
+}
+
+struct DrillRun {
+    questions: Vec<Question>,
+    pos: usize,
+    input: String,
+    /// Some(right?) once the current question is answered.
+    result: Option<bool>,
+    right: usize,
+    mistakes: Vec<(Question, String)>,
 }
 
 /// Most words the overlay shows; nearest ones first.
@@ -286,6 +364,7 @@ pub struct DazaiApp {
     browse: BrowseState,
     add: AddForm,
     word_graph: Option<WordGraph>,
+    drill: Drill,
 
     session: Option<Session>,
     session_label: String,
@@ -331,6 +410,7 @@ impl DazaiApp {
             browse: BrowseState::default(),
             add: AddForm::default(),
             word_graph: None,
+            drill: Drill::default(),
             session: None,
             session_label: String::new(),
             bank_count: 0,
@@ -693,6 +773,7 @@ impl DazaiApp {
     }
 
     fn pick_next(&mut self) -> Option<usize> {
+        let ghosts_on = self.bunpro() && self.data.settings.ghosts;
         let now = Self::now();
         let day_end = self.due_cutoff();
         let ahead = now + self.data.settings.learn_ahead_minutes as i64 * 60;
@@ -700,8 +781,8 @@ impl DazaiApp {
         match &mut self.session {
             None => None,
             Some(Session::Casual { queue, .. }) => queue.pop_front(),
-            Some(Session::Srs { new_queue, retry, retrying }) => {
-                *retrying = false;
+            Some(Session::Srs { new_queue, retry, slot }) => {
+                *slot = Slot::Normal;
                 let earliest = |pred: &dyn Fn(&CardState) -> bool| {
                     states
                         .iter()
@@ -715,13 +796,26 @@ impl DazaiApp {
                     new_queue.pop_front();
                 }
                 let next = earliest(&|s| learning(s) && s.due <= now)
-                    .or_else(|| earliest(&|s| s.phase == Phase::Review && s.due <= day_end))
-                    .or_else(|| new_queue.front().copied());
+                    .or_else(|| earliest(&|s| s.phase == Phase::Review && s.due <= day_end));
                 if next.is_some() {
                     return next;
                 }
+                // Ghost reviews of recently missed words (only once their main review isn't due).
+                let ghost = states
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| s.ghost.is_some_and(|g| g.due <= now) && !retry.contains(i))
+                    .min_by_key(|(_, s)| s.ghost.map(|g| g.due))
+                    .map(|(i, _)| i);
+                if ghosts_on && ghost.is_some() {
+                    *slot = Slot::Ghost;
+                    return ghost;
+                }
+                if let Some(i) = new_queue.front().copied() {
+                    return Some(i);
+                }
                 if let Some(i) = retry.pop_front() {
-                    *retrying = true;
+                    *slot = Slot::Retry;
                     return Some(i);
                 }
                 earliest(&|s| learning(s) && s.due <= ahead)
@@ -745,7 +839,7 @@ impl DazaiApp {
         prio.extend(rest);
         prio.truncate(new);
         self.session_label = if prio.is_empty() { "Reviews".into() } else { format!("Reviews + {} new", prio.len()) };
-        self.session = Some(Session::Srs { new_queue: prio.into(), retry: VecDeque::new(), retrying: false });
+        self.session = Some(Session::Srs { new_queue: prio.into(), retry: VecDeque::new(), slot: Slot::Normal });
         self.save();
         self.study = Study::Pick;
     }
@@ -813,7 +907,7 @@ impl DazaiApp {
         }
         self.shuffle(&mut idxs);
         self.session_label = format!("Reviews + {} generated", idxs.len());
-        self.session = Some(Session::Srs { new_queue: idxs.into(), retry: VecDeque::new(), retrying: false });
+        self.session = Some(Session::Srs { new_queue: idxs.into(), retry: VecDeque::new(), slot: Slot::Normal });
         self.gen.status.clear();
         if self.screen == Screen::Study {
             self.study = Study::Pick;
@@ -879,8 +973,61 @@ impl DazaiApp {
         self.on_reveal(idx);
     }
 
+    fn slot(&self) -> Slot {
+        match &self.session {
+            Some(Session::Srs { slot, .. }) => *slot,
+            _ => Slot::Normal,
+        }
+    }
+
     fn is_retry(&self) -> bool {
-        matches!(self.session, Some(Session::Srs { retrying: true, .. }))
+        self.slot() == Slot::Retry
+    }
+
+    fn is_leech(&self, idx: usize) -> bool {
+        self.state(idx).lapses >= self.data.settings.leech_threshold.max(1)
+    }
+
+    fn leeches(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = (0..self.cards.len()).filter(|&i| self.is_leech(i)).collect();
+        v.sort_by_key(|&i| std::cmp::Reverse(self.state(i).lapses));
+        v
+    }
+
+    /// Ghost reviews due now.
+    fn ghosts_due(&self) -> usize {
+        if !(self.bunpro() && self.data.settings.ghosts) {
+            return 0;
+        }
+        let now = Self::now();
+        (0..self.cards.len()).filter(|&i| self.state(i).ghost.is_some_and(|g| g.due <= now)).count()
+    }
+
+    /// Casual practice of the leeches (doesn't change scheduling).
+    fn start_leech_session(&mut self) {
+        let mut v = self.leeches();
+        self.shuffle(&mut v);
+        let total = v.len();
+        self.session_label = format!("Leech practice · {total} words");
+        self.session = Some(Session::Casual { queue: v.into(), total, right: 0, answered: 0 });
+        self.study = Study::Pick;
+    }
+
+    /// Moves a word's ghost on after a ghost answer, or starts one after a miss.
+    fn update_ghost(&mut self, idx: usize, good: bool, fresh_miss: bool) {
+        let now = Self::now();
+        let id = self.cards[idx].id.clone();
+        let mut st = self.state(idx);
+        st.ghost = match (st.ghost, good, fresh_miss) {
+            (_, false, _) => Some(srs::Ghost { due: srs::ceil_hour(now + (srs::GHOST_HOURS[0] * 3600.0) as i64), step: 0 }),
+            (Some(g), true, false) => {
+                let next = g.step as usize + 1;
+                srs::GHOST_HOURS.get(next).map(|h| srs::Ghost { due: srs::ceil_hour(now + (h * 3600.0) as i64), step: next as u8 })
+            }
+            (g, true, _) => g,
+        };
+        self.data.states.insert(id, st);
+        self.save();
     }
 
     /// Records an answer. Random study never schedules; Bunpro-style sessions bring missed words
@@ -891,13 +1038,22 @@ impl DazaiApp {
             return;
         }
         let bunpro = self.bunpro();
-        let retrying = self.is_retry();
-        if !(bunpro && retrying) {
-            self.answer(idx, if good { Grade::Good } else { Grade::Again });
+        let slot = self.slot();
+        match slot {
+            Slot::Normal => self.answer(idx, if good { Grade::Good } else { Grade::Again }),
+            Slot::Retry if !bunpro => self.answer(idx, if good { Grade::Good } else { Grade::Again }),
+            Slot::Retry => {}
+            Slot::Ghost => self.update_ghost(idx, good, false),
+        }
+        // A fresh miss of a word you'd learned leaves a ghost behind.
+        if bunpro && !good && slot == Slot::Normal && self.data.settings.ghosts {
+            self.update_ghost(idx, false, true);
         }
         if bunpro && !good {
             if let Some(Session::Srs { retry, .. }) = &mut self.session {
-                retry.push_back(idx);
+                if !retry.contains(&idx) {
+                    retry.push_back(idx);
+                }
             }
         }
     }
@@ -1058,6 +1214,7 @@ impl DazaiApp {
                         (Screen::Study, "Study"),
                         (Screen::Browse, "Browse"),
                         (Screen::Add, "Add"),
+                        (Screen::Conjugate, "Conjugate"),
                         (Screen::Stats, "Stats"),
                     ] {
                         let active = self.screen == screen;
@@ -1101,6 +1258,16 @@ impl DazaiApp {
             };
         }
 
+        // Small tag above the word: why it's being asked.
+        let tag = match &self.study {
+            Study::Asking { idx, .. } => match (self.slot(), self.is_leech(*idx)) {
+                (Slot::Ghost, _) => Some(("ghost review", BLUE)),
+                (Slot::Retry, _) => Some(("missed earlier: try again", RED)),
+                (_, true) => Some(("leech", AMBER)),
+                _ => None,
+            },
+            _ => None,
+        };
         let avail = ui.available_height();
         match &mut self.study {
             Study::Menu => self.menu_ui(ui),
@@ -1147,6 +1314,9 @@ impl DazaiApp {
                 let mut quit = false;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&self.session_label).small().color(MUTED));
+                    if let Some((t, c)) = tag {
+                        ui.label(RichText::new(t).small().color(c));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new("End session").small().color(MUTED)).frame(false)).clicked() {
                             quit = true;
@@ -1239,8 +1409,10 @@ impl DazaiApp {
                             Some((t, n)) => format!(" · next: {n} at {}", clock(t)),
                             None => String::new(),
                         };
+                        let ghosts = self.ghosts_due();
+                        let ghosts = if ghosts > 0 { format!(" (+{ghosts} ghosts)") } else { String::new() };
                         format!(
-                            "{} reviews due{next} · {} in the next 24h · {} words in the bank",
+                            "{} reviews due{ghosts}{next} · {} in the next 24h · {} words in the bank",
                             review + learn,
                             self.due_within(86_400),
                             bank.len()
@@ -1277,10 +1449,11 @@ impl DazaiApp {
                             ui.label(RichText::new("· priority words always come first").small().color(MUTED));
                         });
                         ui.add_space(6.0);
+                        let due = review + learn + self.ghosts_due();
                         let label = if self.bank_count == 0 {
-                            format!("Start: {} reviews", review + learn)
+                            format!("Start: {due} reviews")
                         } else {
-                            format!("Start: {} reviews + {} new", review + learn, self.bank_count)
+                            format!("Start: {due} reviews + {} new", self.bank_count)
                         };
                         if ui.add(egui::Button::new(label).min_size(egui::vec2(180.0, 32.0))).clicked() {
                             let n = self.bank_count as usize;
@@ -1372,6 +1545,44 @@ impl DazaiApp {
                             self.start_casual(n);
                         }
                     });
+                    // 4. Leeches
+                    let leeches = self.leeches();
+                    if !leeches.is_empty() {
+                        ui.add_space(10.0);
+                        card_frame().show(ui, |ui| {
+                            ui.set_width(width - 32.0);
+                            ui.label(RichText::new(format!("Leeches ({})", leeches.len())).size(17.0).color(AMBER));
+                            ui.label(
+                                RichText::new(format!(
+                                    "Words you've missed {}+ times. Hover for a reminder, click for the word's graph.",
+                                    self.data.settings.leech_threshold
+                                ))
+                                .small()
+                                .color(MUTED),
+                            );
+                            let mut open = None;
+                            ui.horizontal_wrapped(|ui| {
+                                for &i in leeches.iter().take(40) {
+                                    let c = &self.cards[i];
+                                    let r = ui
+                                        .add(egui::Label::new(RichText::new(&c.word).size(18.0).color(AMBER)).sense(egui::Sense::click()))
+                                        .on_hover_text(format!("{}\n{}\nmissed {} times", c.readings[0], c.meaning, self.state(i).lapses));
+                                    if r.clicked() {
+                                        open = Some(i);
+                                    }
+                                    ui.add_space(6.0);
+                                }
+                            });
+                            ui.add_space(6.0);
+                            if ui.add(egui::Button::new("Practise leeches").min_size(egui::vec2(180.0, 32.0))).clicked() {
+                                self.start_leech_session();
+                            }
+                            ui.label(RichText::new("Casual practice: doesn't change scheduling.").small().color(MUTED));
+                            if let Some(i) = open {
+                                self.open_graph_for(i);
+                            }
+                        });
+                    }
                     ui.add_space(16.0);
                 });
             });
@@ -1411,6 +1622,16 @@ impl DazaiApp {
                 ui.label(RichText::new(typed).small().color(MUTED).strikethrough());
             }
         }
+        if self.is_leech(idx) {
+            ui.label(
+                RichText::new(format!(
+                    "leech · missed {} times. Take a moment with the kanji and examples below.",
+                    self.state(idx).lapses
+                ))
+                .small()
+                .color(AMBER),
+            );
+        }
         ui.add_space(12.0);
         ui.label(RichText::new(&card.meaning).size(20.0));
         if !card.notes.is_empty() {
@@ -1443,6 +1664,14 @@ impl DazaiApp {
             ("Missed it".to_string(), "Got it".to_string())
         } else if self.is_retry() {
             ("Again  · retry".to_string(), "Good  · cleared".to_string())
+        } else if self.slot() == Slot::Ghost {
+            let st = self.state(idx);
+            let next = st.ghost.map(|g| g.step as usize + 1).and_then(|n| srs::GHOST_HOURS.get(n).copied());
+            let good = match next {
+                Some(h) => format!("Good  · ghost {}", srs::format_secs((h * 3600.0) as i64)),
+                None => "Good  · ghost gone".to_string(),
+            };
+            ("Again  · ghost 1d".to_string(), good)
         } else {
             let state = self.state(idx);
             let s = &self.data.settings;
@@ -2096,6 +2325,251 @@ impl DazaiApp {
 
     // ---------------------------------------------------------- graph / dashboard
 
+    // ---------------------------------------------------------- conjugation drill
+
+    /// Verbs and adjectives you've passed, in the enabled groups.
+    fn drill_pool(&self) -> Vec<Word> {
+        let mut seen = HashSet::new();
+        self.passed()
+            .into_iter()
+            .filter_map(|i| {
+                let c = &self.cards[i];
+                conj::classify(&c.word, &c.readings[0], &c.notes, &c.meaning)
+            })
+            .filter(|w| self.drill.groups[drill_group(w.class)])
+            .filter(|w| seen.insert(w.surface.clone()))
+            .collect()
+    }
+
+    fn random_form(&mut self, w: &Word) -> Option<Form> {
+        let kinds: Vec<Kind> = KINDS.iter().copied().enumerate().filter(|(i, _)| self.drill.kinds[*i]).map(|(_, k)| k).collect();
+        if kinds.is_empty() {
+            return None;
+        }
+        for _ in 0..30 {
+            let kind = kinds[(self.rand() % kinds.len() as u64) as usize];
+            let f = Form {
+                kind,
+                polite: self.drill.polite && self.rand() % 2 == 0,
+                negative: self.drill.negative && self.rand() % 2 == 0,
+                past: self.drill.past && self.rand() % 2 == 0,
+            };
+            let (p, n, t) = kind.toggles();
+            let f = Form { polite: f.polite && p, negative: f.negative && n, past: f.past && t, kind };
+            if conj::conjugate(w, f).is_some() {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    fn start_drill(&mut self) {
+        let pool = self.drill_pool();
+        if pool.is_empty() {
+            return;
+        }
+        let mut questions = Vec::new();
+        let mut tries = 0;
+        while questions.len() < self.drill.count as usize && tries < self.drill.count * 50 {
+            tries += 1;
+            let w = pool[(self.rand() % pool.len() as u64) as usize].clone();
+            let (Some(from), Some(to)) = (self.random_form(&w), self.random_form(&w)) else { continue };
+            let shown = conj::conjugate(&w, from).unwrap().remove(0);
+            let answers = conj::conjugate(&w, to).unwrap();
+            let same = answers.iter().any(|a| *a == shown);
+            if same && (!self.drill.trick || self.rand() % 4 != 0) {
+                continue; // trick questions (answer = the given form) stay rare
+            }
+            questions.push(Question { word: w, from, shown, to, answers });
+        }
+        self.drill.run = Some(DrillRun { questions, pos: 0, input: String::new(), result: None, right: 0, mistakes: Vec::new() });
+    }
+
+    fn drill_ui(&mut self, ui: &mut egui::Ui, enter: bool, esc: bool) {
+        if self.drill.run.is_none() {
+            self.drill_setup_ui(ui, enter);
+            return;
+        }
+        let furigana = self.drill.furigana;
+        let run = self.drill.run.as_mut().unwrap();
+        let avail = ui.available_height();
+
+        // Finished: score and mistakes.
+        if run.pos >= run.questions.len() {
+            let (right, total) = (run.right, run.questions.len());
+            let mistakes = run.mistakes.clone();
+            let mut again = false;
+            let mut back = false;
+            egui::ScrollArea::vertical().id_salt("drill-end").auto_shrink([false, false]).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(30.0);
+                    ui.label(RichText::new(format!("{right} / {total}")).font(display_font(48.0)));
+                    ui.label(RichText::new("right").color(MUTED));
+                    ui.add_space(16.0);
+                    row(ui, |ui| {
+                        ui.add_space((ui.available_width() - 300.0).max(0.0) / 2.0);
+                        if ui.add(egui::Button::new("Again").min_size(egui::vec2(140.0, 34.0))).clicked() || enter {
+                            again = true;
+                        }
+                        if ui.add(egui::Button::new("Change settings").min_size(egui::vec2(150.0, 34.0))).clicked() {
+                            back = true;
+                        }
+                    });
+                    if !mistakes.is_empty() {
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("Mistakes").color(MUTED));
+                        for (q, typed) in &mistakes {
+                            let a = &q.answers[0];
+                            ui.label(RichText::new(format!("{}  →  {}", q.shown.surface, q.to.describe())).size(16.0));
+                            ui.label(RichText::new(format!("{}  ({})", a.surface, a.reading)).size(18.0).color(GREEN));
+                            if !typed.is_empty() {
+                                ui.label(RichText::new(typed).small().color(MUTED).strikethrough());
+                            }
+                            ui.add_space(8.0);
+                        }
+                    }
+                });
+            });
+            if again {
+                self.start_drill();
+            } else if back {
+                self.drill.run = None;
+            }
+            return;
+        }
+
+        let q = run.questions[run.pos].clone();
+        let mut submit = false;
+        let mut next = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{} / {}  ·  {} right", run.pos + 1, run.questions.len(), run.right)).small().color(MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(egui::Button::new(RichText::new("Stop").small().color(MUTED)).frame(false)).clicked() {
+                    run.pos = run.questions.len();
+                }
+            });
+        });
+        ui.vertical_centered(|ui| {
+            ui.add_space((avail * 0.12).max(10.0));
+            if furigana && q.shown.surface != q.shown.reading {
+                ui.label(RichText::new(&q.shown.reading).size(16.0).color(MUTED));
+            }
+            ui.label(RichText::new(&q.shown.surface).font(display_font(52.0)));
+            ui.label(RichText::new(q.from.describe()).small().color(MUTED));
+            ui.add_space(14.0);
+            ui.label(RichText::new("Change to").small().color(MUTED));
+            ui.label(RichText::new(q.to.describe()).size(22.0).color(AMBER));
+            ui.add_space(16.0);
+            match run.result {
+                None => {
+                    let edit = egui::TextEdit::singleline(&mut run.input)
+                        .font(FontId::new(26.0, FontFamily::Proportional))
+                        .horizontal_align(egui::Align::Center)
+                        .desired_width(380.0)
+                        .hint_text(RichText::new("答え").color(MUTED.gamma_multiply(0.6)))
+                        .margin(egui::Margin::symmetric(8, 8));
+                    ui.add(edit).request_focus();
+                    ui.label(RichText::new("kanji or hiragana · Enter to check · Esc if you don't know").small().color(MUTED));
+                    submit = enter;
+                }
+                Some(ok) => {
+                    let a = &q.answers[0];
+                    ui.label(RichText::new(if ok { "Right" } else { "Not quite" }).size(18.0).color(if ok { GREEN } else { RED }));
+                    if !ok && !run.input.trim().is_empty() {
+                        ui.label(RichText::new(run.input.trim()).color(MUTED).strikethrough());
+                    }
+                    ui.label(RichText::new(&a.surface).font(display_font(34.0)).color(if ok { GREEN } else { TEXT }));
+                    if a.surface != a.reading {
+                        ui.label(RichText::new(&a.reading).size(17.0).color(SOFT));
+                    }
+                    if q.answers.len() > 1 {
+                        let alts: Vec<&str> = q.answers[1..].iter().map(|p| p.surface.as_str()).collect();
+                        ui.label(RichText::new(format!("also right: {}", alts.join(" · "))).small().color(MUTED));
+                    }
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(format!("{} ({}) · {} · {}", q.word.surface, q.word.reading, q.word.class.label(), q.word.meaning))
+                            .small()
+                            .color(MUTED),
+                    );
+                    ui.add_space(10.0);
+                    if ui.add(egui::Button::new("Next").min_size(egui::vec2(140.0, 34.0))).clicked() || enter {
+                        next = true;
+                    }
+                }
+            }
+        });
+        let run = self.drill.run.as_mut().unwrap();
+        if run.result.is_none() && (submit || esc) {
+            let typed = check::normalize(run.input.trim());
+            if typed.is_empty() && !esc {
+                return;
+            }
+            let ok = !esc
+                && q.answers.iter().any(|a| check::normalize(&a.surface) == typed || check::normalize(&a.reading) == typed);
+            run.result = Some(ok);
+            if ok {
+                run.right += 1;
+            } else {
+                run.mistakes.push((q, run.input.trim().to_string()));
+            }
+        } else if next {
+            run.pos += 1;
+            run.input.clear();
+            run.result = None;
+        }
+    }
+
+    fn drill_setup_ui(&mut self, ui: &mut egui::Ui, enter: bool) {
+        let pool = self.drill_pool().len();
+        let mut go = false;
+        egui::ScrollArea::vertical().id_salt("drill-setup").auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(8.0);
+            ui.heading("Conjugation drill");
+            ui.label(
+                RichText::new("You get a word in one form and type it in another, using only verbs and adjectives you've learned. Doesn't affect your reviews.")
+                    .small()
+                    .color(MUTED),
+            );
+            ui.add_space(10.0);
+            let d = &mut self.drill;
+            row(ui, |ui| {
+                ui.label("Questions");
+                ui.add(egui::DragValue::new(&mut d.count).range(1..=200));
+            });
+            ui.add_space(6.0);
+            ui.columns(2, |cols| {
+                cols[0].label(RichText::new("Forms").color(MUTED));
+                cols[0].checkbox(&mut d.polite, "Politeness (plain ↔ polite)");
+                cols[0].checkbox(&mut d.negative, "Negative");
+                cols[0].checkbox(&mut d.past, "Past");
+                for (i, k) in KINDS.iter().enumerate() {
+                    cols[0].checkbox(&mut d.kinds[i], k.label());
+                }
+                cols[1].label(RichText::new("Words").color(MUTED));
+                for (i, g) in DRILL_GROUPS.iter().enumerate() {
+                    cols[1].checkbox(&mut d.groups[i], *g);
+                }
+                cols[1].add_space(10.0);
+                cols[1].label(RichText::new("Options").color(MUTED));
+                cols[1].checkbox(&mut d.trick, "Trick questions (answer may be the given form)");
+                cols[1].checkbox(&mut d.furigana, "Furigana on the given form");
+            });
+            ui.add_space(10.0);
+            ui.label(RichText::new(format!("{pool} learned words in the selected groups")).color(MUTED));
+            let ready = pool > 0 && self.drill.kinds.iter().any(|k| *k);
+            if ui.add_enabled(ready, egui::Button::new("Go").min_size(egui::vec2(160.0, 36.0))).clicked() || (enter && ready) {
+                go = true;
+            }
+            if !ready {
+                ui.label(RichText::new("Pick at least one form and one word group with learned words.").small().color(AMBER));
+            }
+        });
+        if go {
+            self.start_drill();
+        }
+    }
+
     // ---------------------------------------------------------- word graph
 
     fn open_graph(&mut self, root: Root) {
@@ -2421,6 +2895,36 @@ impl DazaiApp {
             );
             ui.add_space(14.0);
 
+            // Leeches
+            let leeches = self.leeches();
+            section(ui, &format!("Leeches ({})", leeches.len()));
+            if leeches.is_empty() {
+                ui.label(RichText::new("None. Words missed often show up here.").small().color(MUTED));
+            }
+            let mut forgive = None;
+            for &i in leeches.iter().take(30) {
+                let c = &self.cards[i];
+                row(ui, |ui| {
+                    ui.label(RichText::new(&c.word).size(18.0).color(AMBER));
+                    ui.label(RichText::new(&c.readings[0]).color(SOFT));
+                    ui.label(RichText::new(format!("missed {}×", states[i].lapses)).small().color(MUTED));
+                    if ui
+                        .add(egui::Button::new(RichText::new("forgive").small().color(MUTED)).frame(false))
+                        .on_hover_text("Reset its miss count so it's no longer a leech")
+                        .clicked()
+                    {
+                        forgive = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = forgive {
+                let mut st = self.state(i);
+                st.lapses = 0;
+                self.data.states.insert(self.cards[i].id.clone(), st);
+                self.save();
+            }
+            ui.add_space(14.0);
+
             // JLPT
             section(ui, "JLPT");
             let mut words_known = [0usize; 5];
@@ -2518,6 +3022,14 @@ impl DazaiApp {
             ui.checkbox(&mut d.settings.autoplay_audio, "Play native audio when the answer is shown");
             ui.checkbox(&mut d.settings.show_pitch, "Show pitch accent");
             ui.checkbox(&mut d.settings.show_sentences, "Show example sentences (Tatoeba)");
+            ui.add_space(16.0);
+            ui.label(RichText::new("Misses").color(MUTED));
+            ui.checkbox(&mut d.settings.ghosts, "Ghost reviews: after a miss, extra reviews in 1 day, 3 days and 1 week (Bunpro-style)");
+            row(ui, |ui| {
+                ui.label("A word becomes a leech after");
+                ui.add(egui::DragValue::new(&mut d.settings.leech_threshold).range(2..=20));
+                ui.label("misses");
+            });
             ui.add_space(16.0);
 
             ui.label(RichText::new("Spacing").color(MUTED));
@@ -2703,6 +3215,7 @@ impl eframe::App for DazaiApp {
                     Screen::Browse => self.browse_ui(ui, enter),
                     Screen::Add => self.add_ui(ui),
                     Screen::Stats => self.stats_ui(ui),
+                    Screen::Conjugate => self.drill_ui(ui, enter, esc),
                     Screen::Settings => self.settings_ui(ui),
                 }
             });

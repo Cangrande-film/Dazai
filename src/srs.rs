@@ -32,6 +32,18 @@ pub const DEFAULT_STAGE_HOURS: [f64; 12] =
 pub const STAGE_GROUPS: [(&str, u32, u32); 5] =
     [("Beginner", 1, 3), ("Adept", 4, 6), ("Seasoned", 7, 9), ("Expert", 10, 11), ("Mastered", 12, u32::MAX)];
 
+/// Ghost reviews: after a miss, extra reviews this many hours apart (1 day, 3 days, 1 week),
+/// on top of the word's normal schedule. A wrong ghost answer starts the ghost over.
+pub const GHOST_HOURS: [f64; 3] = [24.0, 72.0, 168.0];
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ghost {
+    /// Unix seconds.
+    pub due: i64,
+    /// Index into GHOST_HOURS of the interval that led here.
+    pub step: u8,
+}
+
 /// Order in which new cards come out of the word bank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum NewOrder {
@@ -67,6 +79,10 @@ pub struct Settings {
     pub autoplay_audio: bool,
     pub show_pitch: bool,
     pub show_sentences: bool,
+    /// Bunpro-style ghost reviews after a miss.
+    pub ghosts: bool,
+    /// Misses after which a word counts as a leech.
+    pub leech_threshold: u32,
     pub new_order: NewOrder,
     /// Last values used on the session menu.
     pub gen_total: u32,
@@ -94,6 +110,8 @@ impl Default for Settings {
             autoplay_audio: true,
             show_pitch: true,
             show_sentences: true,
+            ghosts: true,
+            leech_threshold: 4,
             new_order: NewOrder::Added,
             gen_total: 10,
             gen_known: 7,
@@ -127,6 +145,9 @@ pub struct CardState {
     /// from their interval the first time they're scheduled.
     #[serde(default)]
     pub stage: u32,
+    /// Pending ghost review, if the word was missed recently.
+    #[serde(default)]
+    pub ghost: Option<Ghost>,
 }
 
 impl CardState {
@@ -140,6 +161,7 @@ impl CardState {
             reps: 0,
             lapses: 0,
             stage: 0,
+            ghost: None,
         }
     }
 }

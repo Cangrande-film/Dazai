@@ -32,6 +32,7 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 | `src/storage.rs` | Deck loading (bundled decks + `decks/` folders), card ids (`word|first reading`), progress file, user cards. |
 | `src/dict.rs` | Network sources (all blocking; called from worker threads): Jisho search, kanjiapi.dev, JapanesePod101 audio, Kanjium pitch data, Tatoeba sentences, frequency list, generated sessions. |
 | `src/extract.rs` | Splits pasted text into words: longest match against the Kanjium word list plus a deinflection table; also katakana words and reduplicated onomatopoeia. |
+| `src/conjugate.rs` | Verb/adjective conjugation on (surface, reading) pairs: `classify` (from card notes POS), `conjugate(word, Form)` → accepted answers (canonical first). Forms: plain/polite × negative × past, て, progressive, desire, volitional, potential, imperative, passive, causative. Test `whole_known_deck` conjugates every known word. |
 | `src/pitch.rs` | Draws readings with their pitch-accent line. |
 | `src/graph.rs` | Force-directed word graph (spatial-grid repulsion) used by the per-word graph overlay. |
 | `src/levels.rs` | JLPT word/kanji level table compiled in from `data/jlpt.json`. |
@@ -63,6 +64,13 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
   goes into the session's `retry` queue and comes back until answered right, and only its first
   answer changes the stage. Menu shows the next batch; Stats has an hourly 24h forecast and
   Bunpro's stage groups (Beginner/Adept/Seasoned/Expert/Mastered).
+- **Ghost reviews** (Bunpro): a miss in a normal review leaves `CardState.ghost`; ghosts come
+  due 1d, 3d, 1w later (`GHOST_HOURS`), are picked after due reviews (`Slot::Ghost`) and only move
+  the ghost, never the stage. A wrong ghost restarts it.
+- **Leeches**: words with `lapses >= leech_threshold` (default 4). Tagged while studying, listed
+  on the menu (with a casual "Practise leeches" session) and in Stats ("forgive" resets lapses).
+- **Conjugate tab**: drill like wkdonc.github.io/conjugation/drill.html, built only from passed
+  words: given form → target form, typed in kanji or kana, no effect on scheduling.
 - **Answering**: Enter submits. The IME uses Enter to commit, so an Enter that ends a composition
   is ignored. Esc = "don't know" (reveals, counts as wrong); a 2+ kana composition wiped without a
   commit is also treated as Esc. Kana-only words have no typing step: reveal, then self-grade.

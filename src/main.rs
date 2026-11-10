@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod check;
+mod conjugate;
 mod dict;
 mod extract;
 mod levels;
