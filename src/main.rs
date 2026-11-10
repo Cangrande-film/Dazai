@@ -117,6 +117,8 @@ fn setup_style(ctx: &egui::Context) {
     // Don't follow the OS light/dark setting; Dazai is always dark.
     ctx.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();
+    // Slider handles: a slim rectangle rather than a big circle.
+    visuals.handle_shape = egui::style::HandleShape::Rect { aspect_ratio: 0.5 };
     let bg = Color32::from_rgb(20, 20, 20);
     visuals.panel_fill = bg;
     visuals.window_fill = bg;

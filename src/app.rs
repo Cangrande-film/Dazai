@@ -429,6 +429,8 @@ pub struct DazaiApp {
     word_graph: Option<WordGraph>,
     /// The progress file exists but couldn't be read: never save over it.
     save_blocked: bool,
+    /// Height both Study-page boxes are drawn at (the taller one's natural height).
+    menu_card_h: f32,
     /// The card on screen is asked English → Japanese.
     reverse: bool,
     /// Direction chosen for each card this session (so a word is never asked both ways).
@@ -501,6 +503,7 @@ impl DazaiApp {
             example_tokens: HashMap::new(),
             reverse: false,
             directions: HashMap::new(),
+            menu_card_h: 0.0,
             card_index: (0, HashMap::new()),
             drill: Drill::default(),
             session: None,
@@ -1873,7 +1876,12 @@ impl DazaiApp {
         let width = ui.available_width().min(1000.0);
         let margin = ((ui.available_width() - width) / 2.0).max(0.0);
         let gap = 14.0;
-        let col_w = ((width - gap) / 2.0).floor();
+        // Side by side when there's room; stacked in narrow windows.
+        let two_cols = width >= 900.0;
+        let col_w = if two_cols { ((width - gap) / 2.0).floor() } else { width };
+        // Side by side, both boxes are drawn as tall as the taller one, Start buttons at the bottom.
+        let target_h = if two_cols { self.menu_card_h } else { 0.0 };
+        let mut heights = [0.0f32; 2];
 
         egui::ScrollArea::vertical().id_salt("menu").auto_shrink([false, false]).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1882,23 +1890,29 @@ impl DazaiApp {
                     ui.set_width(width);
                     ui.add_space(16.0);
                     ui.label(RichText::new("今日の勉強").font(display_font(34.0)));
-                    let header = if self.bunpro() {
-                        let next = match self.next_batch() {
-                            Some((t, n)) => format!(" · next: {n} at {}", clock(t)),
-                            None => String::new(),
+
+                    // Status line: what's due now stands out, the rest is context.
+                    let due_now = review + learn;
+                    let ghosts = self.ghosts_due();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let due_text = if ghosts > 0 {
+                            format!("{due_now} reviews due (+{ghosts} ghosts)")
+                        } else {
+                            format!("{due_now} reviews due")
                         };
-                        let ghosts = self.ghosts_due();
-                        let ghosts = if ghosts > 0 { format!(" (+{ghosts} ghosts)") } else { String::new() };
-                        format!(
-                            "{} reviews due{ghosts}{next} · {} in the next 24h · {} words in the bank",
-                            review + learn,
-                            self.due_within(86_400),
-                            bank.len()
-                        )
-                    } else {
-                        format!("{review} reviews due · {learn} learning · {} words in the bank", bank.len())
-                    };
-                    ui.label(RichText::new(header).color(MUTED));
+                        ui.label(RichText::new(due_text).color(if due_now + ghosts > 0 { TEXT } else { SOFT }));
+                        let rest = if self.bunpro() {
+                            let next = match self.next_batch() {
+                                Some((t, n)) => format!("  ·  next: {n} at {}", clock(t)),
+                                None => String::new(),
+                            };
+                            format!("{next}  ·  {} in the next 24h  ·  {} words in the bank", self.due_within(86_400), bank.len())
+                        } else {
+                            format!("  ·  {learn} learning  ·  {} words in the bank", bank.len())
+                        };
+                        ui.label(RichText::new(rest).color(MUTED));
+                    });
                     ui.add_space(14.0);
 
                     let card_frame = || {
@@ -1907,192 +1921,210 @@ impl DazaiApp {
                             .corner_radius(8.0)
                             .inner_margin(egui::Margin::symmetric(16, 14))
                     };
+                    let start_button = |label: String, enabled: bool| {
+                        egui::Button::new(RichText::new(label).color(if enabled { TEXT } else { MUTED }))
+                            .min_size(egui::vec2(220.0, 34.0))
+                            .stroke(egui::Stroke::new(1.0_f32, Color32::from_gray(if enabled { 80 } else { 55 })))
+                    };
 
-                    // Learning (left) and drilling (right), side by side.
-                    let due = review + learn + self.ghosts_due();
+                    let due = review + learn + ghosts;
                     if self.review_count_auto {
                         self.review_count = due as u32;
                     }
                     self.review_count = self.review_count.min(due as u32);
-                    ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = gap;
-                    // 1. Learning session: reviews, plus optional new words (word bank or generated)
-                    ui.vertical(|ui| {
-                    ui.set_width(col_w);
-                    card_frame().show(ui, |ui| {
-                        ui.set_width(col_w - 32.0);
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.label(RichText::new("Learning session").size(17.0));
-                        ui.label(RichText::new("Due reviews, plus new words if you like.").small().color(MUTED));
-                        ui.add_space(4.0);
-                        row(ui, |ui| {
-                            ui.label("Reviews");
-                            if ui.add(egui::DragValue::new(&mut self.review_count).range(0..=due as u32)).changed() {
-                                self.review_count_auto = false;
-                            }
-                            ui.label(RichText::new(format!("of {due} due")).color(MUTED));
-                            if !self.review_count_auto && ui.add(egui::Button::new(RichText::new("all").small().color(MUTED)).frame(false)).clicked() {
-                                self.review_count_auto = true;
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("New words");
-                            let st = &mut self.data.settings;
-                            ui.radio_value(&mut st.new_source, NewSource::None, "none");
-                            ui.radio_value(&mut st.new_source, NewSource::Bank, format!("word bank ({})", bank.len()));
-                            ui.radio_value(&mut st.new_source, NewSource::Generate, "generate");
-                        });
-                        let source = self.data.settings.new_source;
-                        match source {
-                            NewSource::None => {}
-                            NewSource::Bank => {
-                                row(ui, |ui| {
-                                    ui.add_space(16.0);
-                                    ui.label("How many");
-                                    self.bank_count = self.bank_count.min(bank.len() as u32);
-                                    ui.add(egui::DragValue::new(&mut self.bank_count).range(0..=bank.len() as u32));
-                                    let p = if prio > 0 { format!(" ({prio} flagged priority)") } else { String::new() };
-                                    ui.label(RichText::new(format!("of {}{p}", bank.len())).color(MUTED));
-                                });
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.add_space(16.0);
-                                    ui.label("Order");
-                                    ui.radio_value(&mut self.data.settings.new_order, NewOrder::Added, "as added");
-                                    ui.radio_value(&mut self.data.settings.new_order, NewOrder::Random, "random");
-                                    ui.label(RichText::new("· priority words first").small().color(MUTED));
-                                });
-                            }
-                            NewSource::Generate => {
-                                let st = &mut self.data.settings;
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.add_space(16.0);
-                                    ui.label("Words");
-                                    ui.add(egui::DragValue::new(&mut st.gen_total).range(1..=50));
-                                    ui.add_space(10.0);
-                                    ui.label("with a kanji you know");
-                                    st.gen_known = st.gen_known.min(st.gen_total);
-                                    ui.add(egui::DragValue::new(&mut st.gen_known).range(0..=st.gen_total));
-                                });
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{} use a kanji you've studied, {} only new kanji. Most frequent first (Leeds corpus), all in JMdict.",
-                                        st.gen_known,
-                                        st.gen_total - st.gen_known
-                                    ))
-                                    .small()
-                                    .color(MUTED),
-                                );
-                            }
-                        }
-                        row(ui, |ui| {
-                            ui.label("English → Japanese");
-                            ui.add(egui::Slider::new(&mut self.data.settings.reverse_percent, 0..=100).suffix("%"))
-                                .on_hover_text("Share of reviews of well-known words asked from the meaning. Replaces the normal question; no extra reviews.");
-                        });
-                        ui.add_space(6.0);
-                        let reviews = self.review_count as usize;
-                        let new = match source {
-                            NewSource::None => 0,
-                            NewSource::Bank => self.bank_count as usize,
-                            NewSource::Generate => self.data.settings.gen_total as usize,
-                        };
-                        let kind = if source == NewSource::Generate { "generated" } else { "new" };
-                        let label = format!("Start: {}", Self::session_name(reviews, new, kind));
-                        row(ui, |ui| {
-                            let ready = (reviews > 0 || new > 0) && !self.gen.running;
-                            if ui.add_enabled(ready, egui::Button::new(label).min_size(egui::vec2(200.0, 32.0))).clicked() {
-                                match source {
-                                    NewSource::Generate => {
-                                        self.pending_reviews = reviews;
-                                        self.start_generation();
-                                    }
-                                    NewSource::Bank => self.start_bank_session(new, reviews),
-                                    NewSource::None => self.start_bank_session(0, reviews),
-                                }
-                            }
-                            if self.gen.running {
-                                ui.spinner();
-                                ui.label(RichText::new(&self.gen.status).small().color(MUTED));
-                            }
-                        });
-                        if let Some(e) = &self.gen.error {
-                            ui.label(RichText::new(e).small().color(RED));
-                        }
-                    });
-                    });
 
-                    // 2. Drilling session: casual practice of passed words
-                    ui.vertical(|ui| {
-                    ui.set_width(col_w);
-                    card_frame().show(ui, |ui| {
-                        ui.set_width(col_w - 32.0);
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.label(RichText::new("Drilling session").size(17.0));
-                        ui.label(RichText::new("Words you've passed, at random. Stages don't change.").small().color(MUTED));
-                        ui.add_space(4.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("From");
-                            let names = ["N5", "N4", "N3", "N2", "N1", "other"];
-                            for (l, name) in names.iter().enumerate() {
-                                let text = RichText::new(format!("{name} ({})", level_counts[l]))
-                                    .color(if self.data.settings.casual_levels[l] { TEXT } else { MUTED });
-                                ui.checkbox(&mut self.data.settings.casual_levels[l], text).on_hover_text(if l == 5 {
-                                    "Passed words outside the JLPT lists"
-                                } else {
-                                    "Passed words of this JLPT level"
+                    let layout = if two_cols {
+                        egui::Layout::left_to_right(egui::Align::Min)
+                    } else {
+                        egui::Layout::top_down(egui::Align::Min)
+                    };
+                    ui.with_layout(layout, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
+
+                        // 1. Learning session: reviews, plus optional new words (word bank or generated).
+                        ui.vertical(|ui| {
+                            ui.set_width(col_w);
+                            card_frame().show(ui, |ui| {
+                                ui.set_width(col_w - 32.0);
+                                let top = ui.cursor().top();
+                                ui.label(RichText::new("Learning session").size(17.0));
+                                ui.label(RichText::new("Due reviews, plus new words if you like.").small().color(MUTED));
+                                ui.add_space(6.0);
+                                field(ui, "Reviews", |ui| {
+                                    if ui.add(egui::DragValue::new(&mut self.review_count).range(0..=due as u32)).changed() {
+                                        self.review_count_auto = false;
+                                    }
+                                    ui.label(RichText::new(format!("of {due} due")).color(MUTED));
+                                    if !self.review_count_auto
+                                        && ui.add(egui::Button::new(RichText::new("all").small().color(MUTED)).frame(false)).clicked()
+                                    {
+                                        self.review_count_auto = true;
+                                    }
                                 });
-                            }
+                                field(ui, "English → Japanese", |ui| {
+                                    percent_slider(ui, &mut self.data.settings.reverse_percent)
+                                        .on_hover_text("Share of reviews of well-known words asked from the meaning. Replaces the normal question; no extra reviews.");
+                                });
+                                field(ui, "New words", |ui| {
+                                    let st = &mut self.data.settings;
+                                    ui.radio_value(&mut st.new_source, NewSource::None, "none");
+                                    ui.radio_value(&mut st.new_source, NewSource::Bank, format!("bank ({})", bank.len()));
+                                    ui.radio_value(&mut st.new_source, NewSource::Generate, "generate");
+                                });
+                                let source = self.data.settings.new_source;
+                                match source {
+                                    NewSource::None => {}
+                                    NewSource::Bank => {
+                                        field(ui, "How many", |ui| {
+                                            self.bank_count = self.bank_count.min(bank.len() as u32);
+                                            ui.add(egui::DragValue::new(&mut self.bank_count).range(0..=bank.len() as u32));
+                                            let p = if prio > 0 { format!(" ({prio} priority)") } else { String::new() };
+                                            ui.label(RichText::new(format!("of {}{p}", bank.len())).color(MUTED));
+                                        });
+                                        field(ui, "Order", |ui| {
+                                            ui.radio_value(&mut self.data.settings.new_order, NewOrder::Added, "as added");
+                                            ui.radio_value(&mut self.data.settings.new_order, NewOrder::Random, "random");
+                                        });
+                                    }
+                                    NewSource::Generate => {
+                                        let st = &mut self.data.settings;
+                                        field(ui, "How many", |ui| {
+                                            ui.add(egui::DragValue::new(&mut st.gen_total).range(1..=50));
+                                        });
+                                        field(ui, "With a known kanji", |ui| {
+                                            st.gen_known = st.gen_known.min(st.gen_total);
+                                            ui.add(egui::DragValue::new(&mut st.gen_known).range(0..=st.gen_total));
+                                            ui.label(RichText::new(format!("{} only new kanji", st.gen_total - st.gen_known)).color(MUTED));
+                                        });
+                                    }
+                                }
+
+                                let reviews = self.review_count as usize;
+                                let new = match source {
+                                    NewSource::None => 0,
+                                    NewSource::Bank => self.bank_count as usize,
+                                    NewSource::Generate => self.data.settings.gen_total as usize,
+                                };
+                                let kind = if source == NewSource::Generate { "generated" } else { "new" };
+                                let ready = (reviews > 0 || new > 0) && !self.gen.running;
+                                let label = if reviews == 0 && new == 0 {
+                                    "Nothing due".to_string()
+                                } else {
+                                    format!("Start: {}", Self::session_name(reviews, new, kind))
+                                };
+                                // Push the button to the bottom so both boxes' buttons line up.
+                                let used = ui.cursor().top() - top;
+                                heights[0] = used + 46.0;
+                                ui.add_space((target_h - used - 46.0).max(0.0));
+                                row(ui, |ui| {
+                                    if ui.add_enabled(ready, start_button(label, ready)).clicked() {
+                                        match source {
+                                            NewSource::Generate => {
+                                                self.pending_reviews = reviews;
+                                                self.start_generation();
+                                            }
+                                            NewSource::Bank => self.start_bank_session(new, reviews),
+                                            NewSource::None => self.start_bank_session(0, reviews),
+                                        }
+                                    }
+                                    if self.gen.running {
+                                        ui.spinner();
+                                        ui.label(RichText::new(&self.gen.status).small().color(MUTED));
+                                    }
+                                });
+                                if let Some(e) = &self.gen.error {
+                                    ui.label(RichText::new(e).small().color(RED));
+                                }
+                            });
                         });
-                        row(ui, |ui| {
-                            let st = &mut self.data.settings;
-                            ui.radio_value(&mut st.casual_timed, false, "set number of words");
-                            ui.radio_value(&mut st.casual_timed, true, "timed");
+
+                        // 2. Drilling session: casual practice of passed words.
+                        ui.vertical(|ui| {
+                            ui.set_width(col_w);
+                            card_frame().show(ui, |ui| {
+                                ui.set_width(col_w - 32.0);
+                                let top = ui.cursor().top();
+                                ui.label(RichText::new("Drilling session").size(17.0));
+                                ui.label(
+                                    RichText::new("Words you've passed, at random. Stages don't change; misses leave a ghost review.")
+                                        .small()
+                                        .color(MUTED),
+                                );
+                                ui.add_space(6.0);
+                                field(ui, "From", |ui| {
+                                    egui::Grid::new("drill-levels").num_columns(3).spacing([14.0, 4.0]).show(ui, |ui| {
+                                        let names = ["N5", "N4", "N3", "N2", "N1", "other"];
+                                        for (l, name) in names.iter().enumerate() {
+                                            let on = self.data.settings.casual_levels[l];
+                                            let text = RichText::new(format!("{name} ({})", level_counts[l])).color(if on { TEXT } else { MUTED });
+                                            ui.checkbox(&mut self.data.settings.casual_levels[l], text).on_hover_text(if l == 5 {
+                                                "Passed words outside the JLPT lists"
+                                            } else {
+                                                "Passed words of this JLPT level"
+                                            });
+                                            if l == 2 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                    });
+                                });
+                                field(ui, "English → Japanese", |ui| {
+                                    percent_slider(ui, &mut self.data.settings.drill_reverse_percent)
+                                        .on_hover_text("Share of drilled words asked from the meaning.");
+                                });
+                                field(ui, "Mode", |ui| {
+                                    let st = &mut self.data.settings;
+                                    ui.radio_value(&mut st.casual_timed, false, "by count");
+                                    ui.radio_value(&mut st.casual_timed, true, "timed");
+                                });
+                                let timed = self.data.settings.casual_timed;
+                                field(ui, if timed { "Minutes" } else { "Words" }, |ui| {
+                                    let st = &mut self.data.settings;
+                                    if timed {
+                                        ui.add(egui::DragValue::new(&mut st.casual_minutes).range(1..=60));
+                                        ui.label(RichText::new(format!("from {passed} passed")).color(MUTED));
+                                    } else {
+                                        st.casual_count = st.casual_count.clamp(1, passed.max(1) as u32);
+                                        ui.add(egui::DragValue::new(&mut st.casual_count).range(1..=passed.max(1) as u32));
+                                        ui.label(RichText::new(format!("of {passed} passed")).color(MUTED));
+                                    }
+                                });
+                                if timed {
+                                    ui.add_space(4.0);
+                                    ui.label(
+                                        RichText::new("Misses don't come back during the run; review them untimed afterwards.")
+                                            .small()
+                                            .color(MUTED),
+                                    );
+                                }
+                                let label = match (passed > 0, timed) {
+                                    (false, _) => "No passed words in those levels".to_string(),
+                                    (true, true) => format!("Start timed drilling ({} min)", self.data.settings.casual_minutes),
+                                    (true, false) => "Start drilling".to_string(),
+                                };
+                                let used = ui.cursor().top() - top;
+                                heights[1] = used + 46.0;
+                                ui.add_space((target_h - used - 46.0).max(0.0));
+                                row(ui, |ui| {
+                                    if ui.add_enabled(passed > 0, start_button(label, passed > 0)).clicked() {
+                                        if timed {
+                                            let m = self.data.settings.casual_minutes;
+                                            self.start_timed(m);
+                                        } else {
+                                            let n = self.data.settings.casual_count as usize;
+                                            self.start_casual(n);
+                                        }
+                                    }
+                                });
+                            });
                         });
-                        ui.horizontal_wrapped(|ui| {
-                            let st = &mut self.data.settings;
-                            if st.casual_timed {
-                                ui.label("Minutes");
-                                ui.add(egui::DragValue::new(&mut st.casual_minutes).range(1..=60));
-                                ui.label(RichText::new(format!("from {passed} passed words")).color(MUTED));
-                            } else {
-                                ui.label("Words");
-                                st.casual_count = st.casual_count.clamp(1, passed.max(1) as u32);
-                                ui.add(egui::DragValue::new(&mut st.casual_count).range(1..=passed.max(1) as u32));
-                                ui.label(RichText::new(format!("of {passed} passed")).color(MUTED));
-                            }
-                        });
-                        row(ui, |ui| {
-                            ui.label("English → Japanese");
-                            ui.add(egui::Slider::new(&mut self.data.settings.drill_reverse_percent, 0..=100).suffix("%"))
-                                .on_hover_text("Share of drilled words asked from the meaning.");
-                        });
-                        if self.data.settings.casual_timed {
-                            ui.label(
-                                RichText::new("Misses don't come back during the run; review them untimed afterwards.")
-                                    .small()
-                                    .color(MUTED),
-                            );
-                        }
-                        ui.label(RichText::new("Misses leave a ghost review.").small().color(MUTED));
-                        ui.add_space(6.0);
-                        let timed = self.data.settings.casual_timed;
-                        let label = if timed {
-                            format!("Start timed drilling ({} min)", self.data.settings.casual_minutes)
-                        } else {
-                            "Start drilling".to_string()
-                        };
-                        if ui.add_enabled(passed > 0, egui::Button::new(label).min_size(egui::vec2(200.0, 32.0))).clicked() {
-                            if timed {
-                                let m = self.data.settings.casual_minutes;
-                                self.start_timed(m);
-                            } else {
-                                let n = self.data.settings.casual_count as usize;
-                                self.start_casual(n);
-                            }
-                        }
                     });
-                    });
-                    });
+                    // Next frame, both boxes take the natural height of the taller one.
+                    let tallest = heights[0].max(heights[1]);
+                    if (tallest - self.menu_card_h).abs() > 0.5 {
+                        self.menu_card_h = tallest;
+                        ui.ctx().request_repaint();
+                    }
                     // 3. Leeches
                     let leeches = self.leeches();
                     if !leeches.is_empty() {
@@ -4033,6 +4065,41 @@ fn progress(ui: &mut egui::Ui, n: usize, total: usize, color: Color32, extra: &s
             ui.label(RichText::new(extra).small().color(MUTED));
         }
     });
+}
+
+/// Width of the label column on the Study page, so every control starts at the same x.
+const FIELD_LABEL_W: f32 = 150.0;
+
+/// A labelled row: the label in a fixed-width column, the controls after it (wrapping under
+/// themselves, not under the label).
+fn field<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal_top(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(FIELD_LABEL_W, ui.spacing().interact_size.y),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_width(FIELD_LABEL_W);
+                ui.label(label);
+            },
+        );
+        ui.vertical(|ui| ui.horizontal_wrapped(|ui| add(ui)).inner).inner
+    })
+    .inner
+}
+
+/// A 0–100 % slider that fills the space left in its row, with its value beside it.
+fn percent_slider(ui: &mut egui::Ui, value: &mut u32) -> egui::Response {
+    let h = ui.spacing().interact_size.y;
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(egui::vec2(w, h), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().slider_width = (w - 60.0).clamp(90.0, 260.0);
+        // The handle is sized from the slider's height; a lower one keeps it small.
+        ui.spacing_mut().interact_size.y = 20.0;
+        let r = ui.add(egui::Slider::new(value, 0..=100).show_value(false));
+        ui.label(RichText::new(format!("{value}%")).color(SOFT));
+        r
+    })
+    .inner
 }
 
 /// A horizontal row of fixed height whose items are all vertically centred, so labels line up
