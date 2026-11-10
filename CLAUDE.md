@@ -27,7 +27,7 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
 |---|---|
 | `src/main.rs` | Window setup, fonts (EB Garamond for Latin, Klee One for Japanese, Yu Gothic fallback; `KLEE_Y_OFFSET` aligns baselines), dark style. `max_passes = 1` is required: egui multipass replayed key input and one Enter answered many cards. |
 | `src/app.rs` | All UI and app state (big file). Screens: Study (session menu → asking → revealed), Browse, Add (single word / from text), Stats, Settings, plus the word-graph overlay window. |
-| `src/srs.rs` | Settings and Anki-like SM-2 scheduling with learning/relearning steps. |
+| `src/srs.rs` | Settings and scheduling. Default is Bunpro-style: SRS stages with fixed hour intervals (`DEFAULT_STAGE_HOURS`: 4h…1y), due times rounded up to the hour (`ceil_hour`), +1 stage when right, -1 when wrong (-2 from stage 7). Anki-style SM-2 is the alternative (`Scheduler::Anki`). Cards from the Anki scheduler get a stage derived from their interval (`stage_of`). |
 | `src/check.rs` | Answer checking: strict / relaxed (katakana→hiragana, small-kana slips, Levenshtein). |
 | `src/storage.rs` | Deck loading (bundled decks + `decks/` folders), card ids (`word|first reading`), progress file, user cards. |
 | `src/dict.rs` | Network sources (all blocking; called from worker threads): Jisho search, kanjiapi.dev, JapanesePod101 audio, Kanjium pitch data, Tatoeba sentences, frequency list, generated sessions. |
@@ -59,6 +59,10 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
   cards first), (2) generate N new words from the frequency list, K of them sharing a kanji the
   user knows, each confirmed on Jisho, (3) random study of passed cards, filterable by JLPT
   level / "other", which never changes scheduling.
+- **Bunpro-style sessions**: reviews due now (hourly batches), then new words; a missed word
+  goes into the session's `retry` queue and comes back until answered right, and only its first
+  answer changes the stage. Menu shows the next batch; Stats has an hourly 24h forecast and
+  Bunpro's stage groups (Beginner/Adept/Seasoned/Expert/Mastered).
 - **Answering**: Enter submits. The IME uses Enter to commit, so an Enter that ends a composition
   is ignored. Esc = "don't know" (reveals, counts as wrong); a 2+ kana composition wiped without a
   commit is also treated as Esc. Kana-only words have no typing step: reveal, then self-grade.
