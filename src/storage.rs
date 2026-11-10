@@ -62,6 +62,9 @@ pub struct SaveData {
     /// Study day ("YYYY-MM-DD") the counter below belongs to.
     pub new_day: String,
     pub new_count: u32,
+    /// Answer history, kept in memory. On disk it's the append-only `reviews.jsonl`; older
+    /// progress files that still contain it are read once and migrated.
+    #[serde(skip_serializing)]
     pub log: Vec<ReviewLog>,
 }
 
@@ -182,7 +185,13 @@ pub fn card_id(word: &str, first_reading: &str) -> String {
 /// Appends a card to `%APPDATA%\Dazai\decks\my_words.json` and returns it.
 pub fn add_user_card(word: &str, readings: &[String], meaning: &str, notes: &str, priority: bool) -> Result<Card, String> {
     let path = user_deck_path();
-    let mut deck = load_deck(&path).unwrap_or(DeckFile { name: "My words".into(), known: false, cards: Vec::new() });
+    let mut deck = if path.exists() {
+        load_deck(&path).map_err(|e| {
+            format!("{} couldn't be read ({e}); fix or move it before adding words, so it isn't overwritten.", path.display())
+        })?
+    } else {
+        DeckFile { name: "My words".into(), known: false, cards: Vec::new() }
+    };
     deck.cards.push(DeckCard {
         word: word.trim().to_string(),
         readings: readings.to_vec(),
@@ -192,7 +201,7 @@ pub fn add_user_card(word: &str, readings: &[String], meaning: &str, notes: &str
     });
     fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     let json = serde_json::to_string_pretty(&deck).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())?;
+    write_atomic(&path, json.as_bytes())?;
     Ok(Card {
         id: card_id(word, &readings[0]),
         word: word.trim().to_string(),
@@ -204,18 +213,93 @@ pub fn add_user_card(word: &str, readings: &[String], meaning: &str, notes: &str
     })
 }
 
-pub fn load_progress() -> SaveData {
-    fs::read_to_string(progress_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
+/// Writes via a temporary file and a rename, so a crash never leaves a half-written file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+/// Progress and, if the file exists but can't be read, an error. In that case the file is
+/// copied aside (`progress.bad-<time>.json`) and the caller must not save over it.
+pub fn load_progress() -> (SaveData, Option<String>) {
+    let path = progress_path();
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (SaveData::default(), None),
+        Err(e) => return (SaveData::default(), Some(format!("Couldn't read {}: {e}", path.display()))),
+    };
+    match serde_json::from_str::<SaveData>(text.trim_start_matches('\u{feff}')) {
+        Ok(mut data) => {
+            // Once a day, keep a copy of the last good file.
+            let bak = data_dir().join("progress.json.bak");
+            let stale = fs::metadata(&bak)
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().map_or(true, |d| d.as_secs() > 86_400))
+                .unwrap_or(true);
+            if stale {
+                let _ = fs::copy(&path, &bak);
+            }
+            // Move answers from old progress files into the append-only log.
+            // Skip entries already there (an older app version may have written them back).
+            let mut log = load_log();
+            let known: HashSet<(i64, String, bool)> = log.iter().map(|l| (l.t, l.id.clone(), l.good)).collect();
+            for l in data.log.drain(..) {
+                if !known.contains(&(l.t, l.id.clone(), l.good)) {
+                    append_log(&l);
+                    log.push(l);
+                }
+            }
+            log.sort_by_key(|l| l.t);
+            data.log = log;
+            (data, None)
+        }
+        Err(e) => {
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let bad = data_dir().join(format!("progress.bad-{stamp}.json"));
+            let _ = fs::copy(&path, &bad);
+            (
+                SaveData::default(),
+                Some(format!(
+                    "Your progress file couldn't be read ({e}). It was copied to {} and won't be overwritten: \
+                     progress isn't being saved until you fix or restore it (a backup may be in progress.json.bak).",
+                    bad.display()
+                )),
+            )
+        }
+    }
+}
+
+fn log_path() -> PathBuf {
+    data_dir().join("reviews.jsonl")
+}
+
+/// The answer history: one JSON line per answer. Unreadable lines are skipped.
+pub fn load_log() -> Vec<ReviewLog> {
+    fs::read_to_string(log_path())
+        .map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
         .unwrap_or_default()
 }
 
+pub fn append_log(entry: &ReviewLog) {
+    use std::io::Write;
+    let _ = fs::create_dir_all(data_dir());
+    if let (Ok(mut f), Ok(line)) = (
+        fs::OpenOptions::new().create(true).append(true).open(log_path()),
+        serde_json::to_string(entry),
+    ) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+pub fn clear_log() {
+    let _ = fs::remove_file(log_path());
+}
+
 pub fn save_progress(data: &SaveData) -> Result<(), String> {
-    let dir = data_dir();
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let json = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
-    let tmp = dir.join("progress.json.tmp");
-    fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, progress_path()).map_err(|e| e.to_string())
+    let json = serde_json::to_string(data).map_err(|e| e.to_string())?;
+    write_atomic(&progress_path(), json.as_bytes())
 }

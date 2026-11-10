@@ -49,7 +49,10 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
   `notes` starts with level tags like `N5 · noun` or `Kaishi · N4 · verb (godan)`.
 - `data/jlpt.json`: word lists N5–N1 (kanji words only) and kanji per level (kanji-data).
 - User data lives in `%APPDATA%\Dazai`:
-  - `progress.json`: settings, card states and review log.
+  - `progress.json`: settings and card states (compact JSON, written atomically; a daily copy
+    goes to `progress.json.bak`). If it exists but can't be parsed, it's copied to
+    `progress.bad-<time>.json` and saving is blocked (`save_blocked`) so it's never overwritten.
+  - `reviews.jsonl`: append-only answer history (old `log` arrays in progress.json are migrated).
   - `decks\my_words.json`: cards the user added.
   - Caches: `accents.txt`, `frequency.txt`, `kanji.json`, `audio\`, `sentences\`.
   - Close the app before editing `progress.json`, or it writes its in-memory state back over your change.

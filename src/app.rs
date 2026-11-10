@@ -394,6 +394,10 @@ pub struct DazaiApp {
     browse: BrowseState,
     add: AddForm,
     word_graph: Option<WordGraph>,
+    /// The progress file exists but couldn't be read: never save over it.
+    save_blocked: bool,
+    /// When the random-study stats screen appeared (Enter is ignored for a moment after).
+    summary_since: Option<std::time::Instant>,
     drill: Drill,
 
     session: Option<Session>,
@@ -422,10 +426,13 @@ impl DazaiApp {
             ));
         }
         let (tx, rx) = channel();
+        let (data, progress_error) = storage::load_progress();
+        let save_blocked = progress_error.is_some();
+        messages.extend(progress_error);
         let mut app = Self {
             ctx: ctx.clone(),
             cards,
-            data: storage::load_progress(),
+            data,
             screen: Screen::Study,
             study: Study::Menu,
             draft: None,
@@ -445,6 +452,8 @@ impl DazaiApp {
             browse: BrowseState::default(),
             add: AddForm::default(),
             word_graph: None,
+            save_blocked,
+            summary_since: None,
             drill: Drill::default(),
             session: None,
             session_label: String::new(),
@@ -473,6 +482,8 @@ impl DazaiApp {
             }
         }
         app.bank_count = app.new_left_today().min(app.bank_size() as u32);
+        // Rewrites progress.json without the answer history (now in reviews.jsonl).
+        app.save();
         app.spawn(|| Msg::Pitch(dict::load_pitch_db()));
         app
     }
@@ -989,6 +1000,15 @@ impl DazaiApp {
     }
 
     fn start_generated(&mut self, entries: Vec<Entry>) {
+        // Another session started while the words were being found: don't replace it.
+        if self.session.is_some() {
+            let added = entries.iter().filter(|e| self.add_entry(e, true).is_ok()).count();
+            self.gen.status.clear();
+            self.messages.push(format!(
+                "{added} generated words were added to your word bank as priority words, since a session was already running."
+            ));
+            return;
+        }
         let mut idxs = Vec::new();
         for e in &entries {
             if self.add_entry(e, false).is_ok() {
@@ -1029,18 +1049,25 @@ impl DazaiApp {
             self.data.new_count += 1;
         }
         let after = srs::schedule(&before, grade, &self.data.settings, now);
-        self.data.log.push(ReviewLog {
+        let entry = ReviewLog {
             t: now,
             id: self.cards[idx].id.clone(),
             good: grade == Grade::Good,
             phase: before.phase,
             ivl: before.interval,
-        });
+        };
+        if !self.save_blocked {
+            storage::append_log(&entry);
+        }
+        self.data.log.push(entry);
         self.data.states.insert(self.cards[idx].id.clone(), after);
-        self.save();
+        // Saved by `grade`, once per answer.
     }
 
     fn save(&mut self) {
+        if self.save_blocked {
+            return;
+        }
         if let Err(e) = storage::save_progress(&self.data) {
             self.messages.push(format!("Could not save progress: {e}"));
         }
@@ -1126,12 +1153,16 @@ impl DazaiApp {
             (g, true, _) => g,
         };
         self.data.states.insert(id, st);
-        self.save();
     }
 
     /// Records an answer. Random study never schedules; Bunpro-style sessions bring missed words
     /// back until they're answered right, and only the first answer moves the SRS stage.
     fn grade(&mut self, idx: usize, good: bool) {
+        self.grade_inner(idx, good);
+        self.save();
+    }
+
+    fn grade_inner(&mut self, idx: usize, good: bool) {
         if self.is_casual() {
             self.casual_answer(idx, good);
             // Casual practice leaves the word's stage alone but still feeds its ghost: a miss
@@ -1160,9 +1191,15 @@ impl DazaiApp {
             Slot::Retry => {}
             Slot::Ghost => self.update_ghost(idx, good, false),
         }
-        // A fresh miss of a word you'd learned leaves a ghost behind.
-        if bunpro && !good && slot == Slot::Normal && self.data.settings.ghosts {
+        // A fresh miss of a word you'd learned leaves a ghost behind (not a brand-new word).
+        if bunpro && !good && slot == Slot::Normal && was_review && self.data.settings.ghosts {
             self.update_ghost(idx, false, true);
+        }
+        // Answering a word's main review right also counts for its due ghost, so the same word
+        // isn't asked twice in a row.
+        let ghost_due = self.state(idx).ghost.is_some_and(|g| g.due <= Self::now());
+        if bunpro && good && slot == Slot::Normal && ghost_due {
+            self.update_ghost(idx, true, false);
         }
         if bunpro && !good {
             if let Some(Session::Srs { retry, .. }) = &mut self.session {
@@ -1184,6 +1221,15 @@ impl DazaiApp {
 
     /// End of a random study / leech practice session: how it went, overall and by level and type.
     fn casual_summary_ui(&mut self, ui: &mut egui::Ui, enter: bool) {
+        // In a timed run it's easy to hit Enter just as time runs out; give the stats screen a
+        // moment before Enter closes it.
+        const GRACE: f32 = 1.5;
+        let since = *self.summary_since.get_or_insert_with(std::time::Instant::now);
+        let waiting = since.elapsed().as_secs_f32() < GRACE;
+        if waiting {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        let enter = enter && !waiting;
         let Some(Session::Casual { results, started, deadline, .. }) = &self.session else { return };
         let (results, started, timed) = (results.clone(), *started, deadline.is_some());
         // Each word's first answer decides "right first try" vs "missed".
@@ -1287,6 +1333,9 @@ impl DazaiApp {
                         if ui.add(egui::Button::new("Back to menu").min_size(egui::vec2(150.0, 34.0))).clicked() || enter {
                             back = true;
                         }
+                        if waiting {
+                            ui.label(RichText::new("Enter works in a moment").small().color(MUTED));
+                        }
                         let again_label = if timed {
                             format!("Review the {} failed (no time limit)", missed.len())
                         } else {
@@ -1304,6 +1353,9 @@ impl DazaiApp {
         });
         if let Some(i) = graph {
             self.open_graph_for(i);
+        }
+        if again.is_some() || back {
+            self.summary_since = None;
         }
         if let Some(list) = again {
             let total = list.len();
@@ -3478,6 +3530,9 @@ impl DazaiApp {
         if reset {
             self.data.states.clear();
             self.data.log.clear();
+            if !self.save_blocked {
+                storage::clear_log();
+            }
             self.data.new_count = 0;
             self.init_known_cards();
             self.save();
@@ -3531,8 +3586,15 @@ impl eframe::App for DazaiApp {
         let enter = enter_pressed && !ime_busy && !overlay;
         // Esc while answering = "I don't know", even mid-composition (readings are plain kana,
         // so there's no conversion to cancel).
+        // A 2+ kana composition wiped without a commit is probably an Esc the IME swallowed, but
+        // it could be select-all + delete, so don't grade anything: just say how to give up.
         let ime_cancelled = wiped && !committed && !enter_pressed;
-        let esc = (esc_pressed || ime_cancelled) && !overlay;
+        if ime_cancelled {
+            if let Study::Asking { hint, .. } = &mut self.study {
+                *hint = Some("Text cleared. Press Esc again if you don't know it.".into());
+            }
+        }
+        let esc = esc_pressed && !overlay;
 
         self.top_bar(ctx);
 

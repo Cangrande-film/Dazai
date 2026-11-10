@@ -232,13 +232,15 @@ fn bunpro_schedule(state: &CardState, grade: Grade, s: &Settings, now: i64) -> C
     let top = hours.len() as u32;
     let cur = stage_of(state, s);
     n.stage = match grade {
-        Grade::Good => (cur + 1).min(top),
+        Grade::Good => cur + 1,
         Grade::Again if cur == 0 => 1,
         Grade::Again => {
             n.lapses += 1;
-            cur.saturating_sub(stages_dropped(cur)).max(1)
+            cur.saturating_sub(stages_dropped(cur))
         }
-    };
+    }
+    // The stage list can be shortened in Settings; keep every card inside it.
+    .clamp(1, top.max(1));
     let h = hours[(n.stage - 1) as usize];
     n.phase = Phase::Review;
     n.step = 0;
@@ -253,6 +255,9 @@ pub fn schedule(state: &CardState, grade: Grade, s: &Settings, now: i64) -> Card
     }
     let mut n = state.clone();
     n.reps += 1;
+    // Anki-style intervals don't follow stages; let a later switch back to Bunpro-style
+    // derive the stage from the interval again (see stage_of).
+    n.stage = 0;
 
     match (state.phase, grade) {
         (Phase::New | Phase::Learning, Grade::Again) => {
@@ -362,6 +367,16 @@ mod tests {
         assert_eq!(miss.stage, 6); // drops two from stage 7 up
         let low = schedule(&schedule(&CardState::new(&s), Grade::Good, &s, now), Grade::Again, &s, now);
         assert_eq!(low.stage, 1); // never below stage 1
+        // A shortened stage list doesn't panic: stage 12 card, 8 stages left.
+        let short = Settings { stage_hours: DEFAULT_STAGE_HOURS[..8].to_vec(), ..Settings::default() };
+        let high = CardState { stage: 12, phase: Phase::Review, ..CardState::new(&s) };
+        assert_eq!(schedule(&high, Grade::Again, &short, now).stage, 8);
+        assert_eq!(schedule(&high, Grade::Good, &short, now).stage, 8);
+        // Anki-style scheduling clears the stage so it's re-derived later.
+        let anki = Settings { scheduler: Scheduler::Anki, ..Settings::default() };
+        let mut st = high.clone();
+        st.interval = 200.0;
+        assert_eq!(schedule(&st, Grade::Good, &anki, now).stage, 0);
         // Cards scheduled the Anki way get a stage from their interval: 60 days -> stage 9 (2 months).
         let mut anki = CardState::new(&s);
         anki.phase = Phase::Review;
