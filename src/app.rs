@@ -93,7 +93,15 @@ enum Session {
         slot: Slot,
     },
     /// Casual review of passed cards; nothing is scheduled.
-    Casual { queue: VecDeque<usize>, total: usize, right: usize, answered: usize },
+    Casual {
+        queue: VecDeque<usize>,
+        right: usize,
+        answered: usize,
+        /// Every answer in order: (card, right?).
+        results: Vec<(usize, bool)>,
+        /// Unix seconds when the session started.
+        started: i64,
+    },
 }
 
 #[derive(Default)]
@@ -282,6 +290,24 @@ fn parse_steps(text: &str) -> Result<Vec<f64>, String> {
             _ => Err(format!("\"{t}\" is not a positive number of minutes")),
         })
         .collect()
+}
+
+const WORD_TYPES: [&str; 5] = ["verbs", "adjectives", "nouns", "adverbs", "other"];
+
+/// Rough word type from a card's notes ("N5 · verb (godan)"), as an index into WORD_TYPES.
+fn word_type(notes: &str) -> usize {
+    let pos = notes.to_lowercase();
+    if pos.contains("verb (") || pos.contains("kuru verb") {
+        0
+    } else if pos.contains("adjective") && !pos.contains("no-adjective") || pos.contains("i-adjective") || pos.contains("na-adjective") {
+        1
+    } else if pos.contains("noun") || pos.contains("pronoun") {
+        2
+    } else if pos.contains("adverb") {
+        3
+    } else {
+        4
+    }
 }
 
 /// "15:00", or "Tue 15:00" when it isn't today.
@@ -866,7 +892,13 @@ impl DazaiApp {
         passed.truncate(n);
         let total = passed.len();
         self.session_label = format!("Random study · {total} words");
-        self.session = Some(Session::Casual { queue: passed.into(), total, right: 0, answered: 0 });
+        self.session = Some(Session::Casual {
+            queue: passed.into(),
+            right: 0,
+            answered: 0,
+            results: Vec::new(),
+            started: Self::now(),
+        });
         self.save();
         self.study = Study::Pick;
     }
@@ -1009,7 +1041,13 @@ impl DazaiApp {
         self.shuffle(&mut v);
         let total = v.len();
         self.session_label = format!("Leech practice · {total} words");
-        self.session = Some(Session::Casual { queue: v.into(), total, right: 0, answered: 0 });
+        self.session = Some(Session::Casual {
+            queue: v.into(),
+            right: 0,
+            answered: 0,
+            results: Vec::new(),
+            started: Self::now(),
+        });
         self.study = Study::Pick;
     }
 
@@ -1077,10 +1115,142 @@ impl DazaiApp {
         self.on_reveal(idx);
     }
 
+    /// End of a random study / leech practice session: how it went, overall and by level and type.
+    fn casual_summary_ui(&mut self, ui: &mut egui::Ui, enter: bool) {
+        let Some(Session::Casual { results, started, .. }) = &self.session else { return };
+        let (results, started) = (results.clone(), *started);
+        // Each word's first answer decides "right first try" vs "missed".
+        let mut seen = HashSet::new();
+        let first: Vec<(usize, bool)> = results.iter().copied().filter(|(i, _)| seen.insert(*i)).collect();
+        let words = first.len();
+        let right_first = first.iter().filter(|(_, g)| *g).count();
+        let missed: Vec<usize> = first.iter().filter(|(_, g)| !*g).map(|(i, _)| *i).collect();
+        let answers = results.len();
+        let secs = (Self::now() - started).max(0);
+        let pct = |n: usize, d: usize| if d == 0 { "–".to_string() } else { format!("{:.0}%", n as f64 * 100.0 / d as f64) };
+
+        let mut by_level = [(0usize, 0usize); 6]; // (words, right first try)
+        let mut by_type = [(0usize, 0usize); 5];
+        for &(i, good) in &first {
+            let l = self.card_level(i);
+            let t = word_type(&self.cards[i].notes);
+            by_level[l].0 += 1;
+            by_type[t].0 += 1;
+            if good {
+                by_level[l].1 += 1;
+                by_type[t].1 += 1;
+            }
+        }
+
+        let width = ui.available_width().min(600.0);
+        let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+        let mut back = false;
+        let mut again: Option<Vec<usize>> = None;
+        let mut graph = None;
+        egui::ScrollArea::vertical().id_salt("casual-summary").auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(margin);
+                ui.vertical(|ui| {
+                    ui.set_width(width);
+                    ui.add_space(16.0);
+                    ui.label(RichText::new("お疲れさま").font(display_font(40.0)));
+                    ui.label(RichText::new(&self.session_label).color(MUTED));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        big_stat(ui, pct(right_first, words), "right first try", GREEN);
+                        big_stat(ui, right_first.to_string(), "right", GREEN);
+                        big_stat(ui, missed.len().to_string(), "missed", RED);
+                        big_stat(ui, answers.to_string(), "answers in total", TEXT);
+                        big_stat(ui, format!("{}:{:02}", secs / 60, secs % 60), "time", MUTED);
+                    });
+                    ui.add_space(14.0);
+
+                    let table = |ui: &mut egui::Ui, id: &str, title: &str, names: &[&str], rows: &[(usize, usize)]| {
+                        section(ui, title);
+                        egui::Grid::new(id).num_columns(4).spacing([18.0, 6.0]).show(ui, |ui| {
+                            ui.label("");
+                            ui.label(RichText::new("right first try").small().color(MUTED));
+                            ui.label(RichText::new("missed").small().color(MUTED));
+                            ui.label(RichText::new("").small());
+                            ui.end_row();
+                            for (k, (n, ok)) in rows.iter().enumerate() {
+                                if *n == 0 {
+                                    continue;
+                                }
+                                ui.label(RichText::new(names[k]).size(16.0).color(BLUE));
+                                progress(ui, *ok, *n, GREEN, "");
+                                ui.label(RichText::new((n - ok).to_string()).color(if n > ok { RED } else { MUTED }));
+                                ui.label(RichText::new(pct(*ok, *n)).color(MUTED));
+                                ui.end_row();
+                            }
+                        });
+                        ui.add_space(14.0);
+                    };
+                    table(ui, "summary-level", "By JLPT level", &["N5", "N4", "N3", "N2", "N1", "other"], &by_level);
+                    table(ui, "summary-type", "By word type", &WORD_TYPES, &by_type);
+
+                    if !missed.is_empty() {
+                        section(ui, &format!("Missed ({})", missed.len()));
+                        ui.horizontal_wrapped(|ui| {
+                            for &i in &missed {
+                                let c = &self.cards[i];
+                                let r = ui
+                                    .add(egui::Label::new(RichText::new(&c.word).size(19.0).color(RED)).sense(egui::Sense::click()))
+                                    .on_hover_text(format!("{}\n{}\nclick for its graph", c.readings[0], c.meaning));
+                                if r.clicked() {
+                                    graph = Some(i);
+                                }
+                                ui.add_space(8.0);
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                    let note = if self.bunpro() && self.data.settings.ghosts {
+                        "Stages and due dates weren't changed. Each missed word got a ghost review."
+                    } else {
+                        "Stages and due dates weren't changed."
+                    };
+                    ui.label(RichText::new(note).small().color(MUTED));
+                    ui.add_space(12.0);
+                    row(ui, |ui| {
+                        if ui.add(egui::Button::new("Back to menu").min_size(egui::vec2(150.0, 34.0))).clicked() || enter {
+                            back = true;
+                        }
+                        if !missed.is_empty()
+                            && ui.add(egui::Button::new(format!("Practise the {} missed", missed.len())).min_size(egui::vec2(190.0, 34.0))).clicked()
+                        {
+                            again = Some(missed.clone());
+                        }
+                    });
+                    ui.add_space(16.0);
+                });
+            });
+        });
+        if let Some(i) = graph {
+            self.open_graph_for(i);
+        }
+        if let Some(list) = again {
+            let total = list.len();
+            self.session_label = format!("Missed words · {total}");
+            self.session = Some(Session::Casual {
+                queue: list.into(),
+                right: 0,
+                answered: 0,
+                results: Vec::new(),
+                started: Self::now(),
+            });
+            self.study = Study::Pick;
+        } else if back {
+            self.session = None;
+            self.study = Study::Menu;
+        }
+    }
+
     /// Casual mode: missed cards come back at the end of the queue; nothing is scheduled.
     fn casual_answer(&mut self, idx: usize, good: bool) {
-        if let Some(Session::Casual { queue, right, answered, .. }) = &mut self.session {
+        if let Some(Session::Casual { queue, right, answered, results, .. }) = &mut self.session {
             *answered += 1;
+            results.push((idx, good));
             if good {
                 *right += 1;
             } else {
@@ -1268,6 +1438,10 @@ impl DazaiApp {
             };
         }
 
+        if matches!(self.study, Study::Done) && self.is_casual() {
+            self.casual_summary_ui(ui, enter);
+            return;
+        }
         // Session name, plus progress for random study / leech practice ("12 left · 7 right").
         let status = match &self.session {
             Some(Session::Casual { queue, right, .. }) => {
@@ -1298,9 +1472,6 @@ impl DazaiApp {
                     ui.label(RichText::new("お疲れさま").font(display_font(44.0)));
                     ui.add_space(8.0);
                     let msg = match &self.session {
-                        Some(Session::Casual { total, right, answered, .. }) => format!(
-                            "Random study done: {total} words, {right} of {answered} answers right. Stages weren't changed; missed words got a ghost review."
-                        ),
                         _ if self.bunpro() => match self.next_batch() {
                             Some((t, n)) => format!(
                                 "Session done. Next reviews: {n} at {}.",
