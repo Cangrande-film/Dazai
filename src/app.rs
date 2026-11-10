@@ -3839,8 +3839,8 @@ impl DazaiApp {
             let desc = match d.settings.check_mode {
                 CheckMode::Strict => "The reading must match exactly.",
                 CheckMode::Relaxed => {
-                    "Katakana is accepted. Small kana / ー slips and one wrong or missing kana \
-                     (two in long words) still pass. Readings of 1–2 kana must be exact."
+                    "Katakana is accepted, and so are slips that sound alike: voicing (か/が, は/ば/ぱ), \
+                     a missing long vowel or っ, small vs. big kana. A different sound is a mistake."
                 }
             };
             ui.label(RichText::new(desc).small().color(MUTED));
