@@ -93,6 +93,8 @@ enum Session {
         slot: Slot,
         /// Due reviews (and ghosts) still to do this session.
         reviews_left: usize,
+        /// Words finished this session (for the completion percentage).
+        done: usize,
     },
     /// Casual review of passed cards; nothing is scheduled.
     Casual {
@@ -941,7 +943,7 @@ impl DazaiApp {
                 }
                 queue.pop_front()
             }
-            Some(Session::Srs { new_queue, retry, slot, reviews_left }) => {
+            Some(Session::Srs { new_queue, retry, slot, reviews_left, .. }) => {
                 *slot = Slot::Normal;
                 let more_reviews = *reviews_left > 0;
                 let earliest = |pred: &dyn Fn(&CardState) -> bool| {
@@ -997,6 +999,7 @@ impl DazaiApp {
             retry: VecDeque::new(),
             slot: Slot::Normal,
             reviews_left: reviews,
+            done: 0,
         });
         self.review_count_auto = true;
         self.save();
@@ -1316,6 +1319,28 @@ impl DazaiApp {
     }
 
     /// Ghost reviews due now.
+    /// How far the current session is, 0.0–1.0: words finished / (finished + still to do);
+    /// timed random study counts elapsed time instead.
+    fn session_progress(&self) -> Option<f32> {
+        let on_screen = usize::from(matches!(self.study, Study::Asking { .. } | Study::Revealed { .. }));
+        let (done, left) = match &self.session {
+            None => return None,
+            Some(Session::Casual { deadline: Some(d), started, .. }) => {
+                let total = (d - started).max(1) as f32;
+                return Some(((Self::now() - started) as f32 / total).clamp(0.0, 1.0));
+            }
+            Some(Session::Casual { queue, right, .. }) => (*right, queue.len() + on_screen),
+            Some(Session::Srs { reviews_left, done, slot, .. }) => {
+                let (new, learn, review) = self.counts();
+                let reviews = (*reviews_left).min(review + self.ghosts_due());
+                // A retry on screen was already taken off the retry queue.
+                let retry_on_screen = if *slot == Slot::Retry { on_screen } else { 0 };
+                (*done, reviews + new + learn + retry_on_screen)
+            }
+        };
+        Some(if done + left == 0 { 1.0 } else { done as f32 / (done + left) as f32 })
+    }
+
     fn ghosts_due(&self) -> usize {
         if !(self.bunpro() && self.data.settings.ghosts) {
             return 0;
@@ -1383,9 +1408,14 @@ impl DazaiApp {
         let bunpro = self.bunpro();
         let slot = self.slot();
         let was_review = self.state(idx).phase == Phase::Review;
-        if slot == Slot::Ghost || (slot == Slot::Normal && was_review) {
-            if let Some(Session::Srs { reviews_left, .. }) = &mut self.session {
+        if let Some(Session::Srs { reviews_left, done, .. }) = &mut self.session {
+            if slot == Slot::Ghost || (slot == Slot::Normal && was_review) {
                 *reviews_left = reviews_left.saturating_sub(1);
+            }
+            // A right answer finishes the word for this session; so does a ghost (a miss
+            // restarts it for another day). Other misses come back, so they still count as left.
+            if good || slot == Slot::Ghost {
+                *done += 1;
             }
         }
         match slot {
@@ -1829,6 +1859,7 @@ impl DazaiApp {
             },
             _ => None,
         };
+        let progress = self.session_progress();
         let avail = ui.available_height();
         match &mut self.study {
             Study::Menu => self.menu_ui(ui),
@@ -1886,8 +1917,15 @@ impl DazaiApp {
                         if ui.add(egui::Button::new(RichText::new("End session").small().color(MUTED)).frame(false)).clicked() {
                             quit = true;
                         }
+                        if let Some(p) = progress {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new(format!("{:.0}%", p * 100.0)).small().color(MUTED));
+                        }
                     });
                 });
+                if let Some(p) = progress {
+                    session_bar(ui, p);
+                }
                 ui.vertical_centered(|ui| {
                     ui.add_space((avail * 0.18).max(20.0));
                     if reverse {
@@ -4244,6 +4282,16 @@ fn field<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R
         ui.vertical(|ui| ui.horizontal_wrapped(|ui| add(ui)).inner).inner
     })
     .inner
+}
+
+/// Thin full-width bar of how far the session is.
+fn session_bar(ui: &mut egui::Ui, p: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 3.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 1.5, Color32::from_rgb(34, 34, 34));
+    let mut fill = rect;
+    fill.set_width(rect.width() * p.clamp(0.0, 1.0));
+    painter.rect_filled(fill, 1.5, GREEN);
 }
 
 /// A 0–100 % slider that fills the space left in its row, with its value beside it.

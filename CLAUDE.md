@@ -89,6 +89,9 @@ cargo test -- --ignored      # also hits Tatoeba / Jisho / frequency list (needs
   (`shares_gloss`) gets a "different word, try again" hint instead of a miss. Words with kanji must be
   answered with kanji (any kanji spelling from JMdict counts); the right reading typed in kana
   only gets a "now write it with kanji" hint, never a miss.
+- **Session progress**: while asking, a thin bar and a percentage show how far the session is
+  (`session_progress`: words finished / finished + still to do; a missed word stays "to do" until
+  answered right; timed drilling shows elapsed time).
 - **Answering**: Enter submits. The IME uses Enter to commit, so an Enter that ends a composition
   is ignored. Esc = "don't know" (reveals, counts as wrong); a 2+ kana composition wiped without a
   commit is also treated as Esc. Kana-only words have no typing step: reveal, then self-grade.
