@@ -8,10 +8,42 @@ const DAY: i64 = 86_400;
 pub enum CheckMode {
     /// The typed reading must match exactly.
     Strict,
-    /// Katakana is accepted, and small slips (one wrong/missing kana, small vs. big kana,
-    /// long-vowel marks) still count as correct.
+    /// Forgiving for new words, stricter as they mature (`Leniency::for_stage`).
+    /// Old saves said "Relaxed", which now means this.
     #[default]
-    Relaxed,
+    #[serde(alias = "Relaxed")]
+    Graduated,
+}
+
+/// How much slack an answer gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leniency {
+    /// The reading exactly (katakana for hiragana is fine).
+    Exact,
+    /// Slips that sound alike: voicing, long vowels, っ, small kana.
+    SoundAlike,
+    /// Sound-alike slips plus one wrong, missing or extra kana (readings of 3+ kana).
+    OneKana,
+}
+
+impl Leniency {
+    /// Graduated mode: Beginner words (stages 0–3) get one wrong kana, Adept and Seasoned (4–9)
+    /// only sound-alike slips, Expert and Mastered (10+) must be exact.
+    pub fn for_stage(stage: u32) -> Leniency {
+        match stage {
+            0..=3 => Leniency::OneKana,
+            4..=9 => Leniency::SoundAlike,
+            _ => Leniency::Exact,
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Leniency::Exact => "exact reading needed",
+            Leniency::SoundAlike => "sound-alike slips allowed",
+            Leniency::OneKana => "one wrong kana allowed",
+        }
+    }
 }
 
 /// How reviews are spaced.
@@ -116,7 +148,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            check_mode: CheckMode::Relaxed,
+            check_mode: CheckMode::Graduated,
             scheduler: Scheduler::Bunpro,
             stage_hours: DEFAULT_STAGE_HOURS.to_vec(),
             learning_steps: vec![1.0, 10.0],

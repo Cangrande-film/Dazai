@@ -1,11 +1,11 @@
 //! Comparing what the user typed against the accepted readings.
 
-use crate::srs::CheckMode;
+use crate::srs::Leniency;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Correct,
-    /// Accepted in relaxed mode, but not an exact match.
+    /// Accepted with the word's leniency, but not an exact match.
     Close,
     Wrong,
 }
@@ -86,34 +86,67 @@ pub fn looks_like_romaji(input: &str) -> bool {
     input.chars().any(|c| c.is_ascii_alphabetic())
 }
 
-pub fn check(input: &str, readings: &[String], mode: CheckMode) -> Verdict {
+/// Edit distance (insert / delete / substitute one char) of at most 1.
+fn within_one(a: &[char], b: &[char]) -> bool {
+    if a.len().abs_diff(b.len()) > 1 {
+        return false;
+    }
+    let (mut i, mut j, mut edits) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        edits += 1;
+        if edits > 1 {
+            return false;
+        }
+        match a.len().cmp(&b.len()) {
+            std::cmp::Ordering::Greater => i += 1,
+            std::cmp::Ordering::Less => j += 1,
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    edits + (a.len() - i) + (b.len() - j) <= 1
+}
+
+pub fn check(input: &str, readings: &[String], leniency: Leniency) -> Verdict {
     let typed = clean(input);
     if typed.is_empty() {
         return Verdict::Wrong;
     }
-    if readings.iter().any(|r| clean(r) == typed) {
+    let hira: Vec<char> = typed.chars().map(kata_to_hira).collect();
+    // Exact, or the same reading typed in katakana.
+    if readings.iter().any(|r| clean(r).chars().map(kata_to_hira).eq(hira.iter().copied())) {
         return Verdict::Correct;
     }
-    if mode == CheckMode::Strict {
+    if leniency == Leniency::Exact {
         return Verdict::Wrong;
     }
-
-    let hira: Vec<char> = typed.chars().map(kata_to_hira).collect();
     let typed_sound = sound(&typed);
-    let mut best = Verdict::Wrong;
+    if typed_sound.is_empty() {
+        return Verdict::Wrong;
+    }
     for r in readings {
-        let rh: Vec<char> = clean(r).chars().map(kata_to_hira).collect();
-        if rh == hira {
-            // Typed in katakana: fully correct in relaxed mode.
-            return Verdict::Correct;
+        // Slips that sound alike: voicing (か/が), long vowels, っ, small kana.
+        let r_sound = sound(r);
+        if r_sound == typed_sound {
+            return Verdict::Close;
         }
-        // Only slips that sound alike pass: voicing (か/が), long vowels, っ, small kana.
-        // A different sound anywhere (a different kanji reading) is a mistake.
-        if !typed_sound.is_empty() && sound(r) == typed_sound {
-            best = Verdict::Close;
+        // New words: one kana wrong, missing or extra (on top of sound-alike slips), but only
+        // in readings of three kana or more, where one kana is still a small part of the word.
+        // Compared kana by kana (voicing and small kana evened out, long vowels kept), so がっせい
+        // for がっこう is two kana off, not one.
+        let kana = |s: &str| -> Vec<char> { s.chars().map(kata_to_hira).filter_map(plain).collect() };
+        if leniency == Leniency::OneKana && clean(r).chars().count() >= 3 && within_one(&kana(&typed), &kana(r)) {
+            return Verdict::Close;
         }
     }
-    best
+    Verdict::Wrong
 }
 
 #[cfg(test)]
@@ -125,38 +158,58 @@ mod tests {
     }
 
     #[test]
-    fn strict() {
+    fn exact() {
         let rs = r(&["がっこう"]);
-        assert_eq!(check("がっこう", &rs, CheckMode::Strict), Verdict::Correct);
-        assert_eq!(check(" がっこう　", &rs, CheckMode::Strict), Verdict::Correct);
-        assert_eq!(check("がこう", &rs, CheckMode::Strict), Verdict::Wrong);
-        assert_eq!(check("ガッコウ", &rs, CheckMode::Strict), Verdict::Wrong);
+        assert_eq!(check("がっこう", &rs, Leniency::Exact), Verdict::Correct);
+        assert_eq!(check(" がっこう　", &rs, Leniency::Exact), Verdict::Correct);
+        assert_eq!(check("ガッコウ", &rs, Leniency::Exact), Verdict::Correct);
+        assert_eq!(check("がこう", &rs, Leniency::Exact), Verdict::Wrong);
     }
 
     #[test]
-    fn relaxed() {
+    fn one_kana() {
         let rs = r(&["がっこう"]);
-        assert_eq!(check("ガッコウ", &rs, CheckMode::Relaxed), Verdict::Correct);
-        // Sound-alike slips: っ, long vowel, voicing.
-        assert_eq!(check("がこう", &rs, CheckMode::Relaxed), Verdict::Close);
-        assert_eq!(check("がっこ", &rs, CheckMode::Relaxed), Verdict::Close);
-        assert_eq!(check("かっこう", &rs, CheckMode::Relaxed), Verdict::Close);
-        assert_eq!(check("がつこう", &rs, CheckMode::Relaxed), Verdict::Wrong); // つ is a sound, not っ
-        // A different sound is a different reading: wrong.
-        assert_eq!(check("がっせい", &rs, CheckMode::Relaxed), Verdict::Wrong);
-        assert_eq!(check("がっこく", &rs, CheckMode::Relaxed), Verdict::Wrong);
-        let gakusei = r(&["がくせい"]);
-        assert_eq!(check("がくせ", &gakusei, CheckMode::Relaxed), Verdict::Close);
-        assert_eq!(check("がくしぇい", &gakusei, CheckMode::Relaxed), Verdict::Wrong);
-        let kyaku = r(&["きゃく"]);
-        assert_eq!(check("きやく", &kyaku, CheckMode::Relaxed), Verdict::Close);
+        assert_eq!(check("がっそう", &rs, Leniency::OneKana), Verdict::Close); // one wrong kana
+        assert_eq!(check("がっそう", &rs, Leniency::SoundAlike), Verdict::Wrong);
+        assert_eq!(check("かっそう", &rs, Leniency::OneKana), Verdict::Close); // plus voicing
+        assert_eq!(check("がっせい", &rs, Leniency::OneKana), Verdict::Wrong); // two sounds off
+        let tabemono = r(&["たべもの"]);
+        assert_eq!(check("たべもん", &tabemono, Leniency::OneKana), Verdict::Close);
+        assert_eq!(check("たもの", &tabemono, Leniency::OneKana), Verdict::Close); // one missing
+        assert_eq!(check("たべものの", &tabemono, Leniency::OneKana), Verdict::Close); // one extra
+        assert_eq!(check("たべまな", &tabemono, Leniency::OneKana), Verdict::Wrong);
+        // Two-kana readings: one kana is half the word, so only sound-alike slips.
         let neko = r(&["ねこ"]);
-        assert_eq!(check("ねご", &neko, CheckMode::Relaxed), Verdict::Close);
-        assert_eq!(check("ねむ", &neko, CheckMode::Relaxed), Verdict::Wrong);
+        assert_eq!(check("ねむ", &neko, Leniency::OneKana), Verdict::Wrong);
+        assert_eq!(check("ねご", &neko, Leniency::OneKana), Verdict::Close);
+        assert!(within_one(&['a', 'b'], &['a', 'b']));
+        assert!(!within_one(&['a', 'b', 'c'], &['c', 'b', 'a']));
+    }
+
+    #[test]
+    fn sound_alike() {
+        let rs = r(&["がっこう"]);
+        assert_eq!(check("ガッコウ", &rs, Leniency::SoundAlike), Verdict::Correct);
+        // Sound-alike slips: っ, long vowel, voicing.
+        assert_eq!(check("がこう", &rs, Leniency::SoundAlike), Verdict::Close);
+        assert_eq!(check("がっこ", &rs, Leniency::SoundAlike), Verdict::Close);
+        assert_eq!(check("かっこう", &rs, Leniency::SoundAlike), Verdict::Close);
+        assert_eq!(check("がつこう", &rs, Leniency::SoundAlike), Verdict::Wrong); // つ is a sound, not っ
+        // A different sound is a different reading: wrong.
+        assert_eq!(check("がっせい", &rs, Leniency::SoundAlike), Verdict::Wrong);
+        assert_eq!(check("がっこく", &rs, Leniency::SoundAlike), Verdict::Wrong);
+        let gakusei = r(&["がくせい"]);
+        assert_eq!(check("がくせ", &gakusei, Leniency::SoundAlike), Verdict::Close);
+        assert_eq!(check("がくしぇい", &gakusei, Leniency::SoundAlike), Verdict::Wrong);
+        let kyaku = r(&["きゃく"]);
+        assert_eq!(check("きやく", &kyaku, Leniency::SoundAlike), Verdict::Close);
+        let neko = r(&["ねこ"]);
+        assert_eq!(check("ねご", &neko, Leniency::SoundAlike), Verdict::Close);
+        assert_eq!(check("ねむ", &neko, Leniency::SoundAlike), Verdict::Wrong);
         let tokei = r(&["とけい"]);
-        assert_eq!(check("とけ", &tokei, CheckMode::Relaxed), Verdict::Close);
-        assert_eq!(check("とかい", &tokei, CheckMode::Relaxed), Verdict::Wrong);
+        assert_eq!(check("とけ", &tokei, Leniency::SoundAlike), Verdict::Close);
+        assert_eq!(check("とかい", &tokei, Leniency::SoundAlike), Verdict::Wrong);
         let hanaji = r(&["はなぢ"]);
-        assert_eq!(check("はなじ", &hanaji, CheckMode::Relaxed), Verdict::Close);
+        assert_eq!(check("はなじ", &hanaji, Leniency::SoundAlike), Verdict::Close);
     }
 }

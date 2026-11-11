@@ -6,7 +6,7 @@ use crate::extract::{self, Found, Token};
 use crate::levels::{Jlpt, LEVELS};
 use crate::graph::{self, Graph, GraphWord};
 use crate::pitch;
-use crate::srs::{self, CardState, CheckMode, Grade, NewOrder, NewSource, Phase, Scheduler, Settings};
+use crate::srs::{self, CardState, CheckMode, Grade, Leniency, NewOrder, NewSource, Phase, Scheduler, Settings};
 use crate::storage::{self, Card, ReviewLog, SaveData};
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use eframe::egui::{self, Color32, FontFamily, FontId, Key, RichText};
@@ -1214,6 +1214,8 @@ impl DazaiApp {
 
     /// English → Japanese answer: the word (kanji or kana) or any of its readings.
     fn submit_reverse(&mut self) {
+        let Study::Asking { idx, .. } = &self.study else { return };
+        let leniency = self.leniency(*idx);
         let Study::Asking { idx, input, hint } = &mut self.study else { return };
         let idx = *idx;
         let typed = input.trim().to_string();
@@ -1239,7 +1241,7 @@ impl DazaiApp {
         }
         // The right reading in kana for a kanji word: not a mistake, just ask for the kanji.
         if needs_kanji && !typed_kanji && !own_spelling {
-            let right_reading = check::check(&typed, &card.readings, self.data.settings.check_mode) != Verdict::Wrong;
+            let right_reading = check::check(&typed, &card.readings, leniency) != Verdict::Wrong;
             if right_reading {
                 *hint = Some("That's the right reading. Now write it with kanji: type it again and convert it (Space).".into());
                 input.clear();
@@ -1249,9 +1251,9 @@ impl DazaiApp {
         let mut verdict = if own_spelling {
             Verdict::Correct
         } else {
-            check::check(&typed, &card.readings, self.data.settings.check_mode)
+            check::check(&typed, &card.readings, leniency)
         };
-        // Relaxed mode forgives a slipped kana, but not when the answer is a different real word
+        // Leniency forgives a slipped kana, but not when the answer is a different real word
         // (びよういん is 美容院, not 病院).
         if verdict == Verdict::Close {
             if crate::jmdict::lookup(&typed, None).is_some_and(|e| e.word != card.word) {
@@ -1274,6 +1276,15 @@ impl DazaiApp {
         self.on_reveal(idx);
     }
 
+    /// How much slack this word's answer gets: by its stage in Graduated mode.
+    fn leniency(&self, idx: usize) -> Leniency {
+        let s = &self.data.settings;
+        match s.check_mode {
+            CheckMode::Strict => Leniency::Exact,
+            CheckMode::Graduated => Leniency::for_stage(srs::stage_of(&self.state(idx), s)),
+        }
+    }
+
     fn submit(&mut self) {
         if self.reverse {
             self.submit_reverse();
@@ -1289,7 +1300,11 @@ impl DazaiApp {
             *hint = Some("That's romaji. Switch the keyboard to hiragana (Alt + `).".into());
             return;
         }
-        let verdict = check::check(&typed, &self.cards[idx].readings, self.data.settings.check_mode);
+        let mut verdict = check::check(&typed, &self.cards[idx].readings, self.leniency(idx));
+        // A forgiven slip that spells another real word is a mistake (びよういん isn't 病院).
+        if verdict == Verdict::Close && crate::jmdict::lookup(&typed, None).is_some_and(|e| e.word != self.cards[idx].word) {
+            verdict = Verdict::Wrong;
+        }
         if verdict == Verdict::Wrong {
             self.grade(idx, false);
         }
@@ -2333,7 +2348,8 @@ impl DazaiApp {
         match verdict {
             Verdict::Correct => {}
             Verdict::Close => {
-                ui.label(RichText::new(format!("close enough: you typed {typed}")).small().color(AMBER));
+                let why = self.leniency(idx).describe();
+                ui.label(RichText::new(format!("close enough ({why}): you typed {typed}")).small().color(AMBER));
             }
             Verdict::Wrong if typed.is_empty() => {
                 ui.label(RichText::new("skipped with Esc").small().color(MUTED));
@@ -3934,13 +3950,15 @@ impl DazaiApp {
             ui.label(RichText::new("Answer checking").color(MUTED));
             ui.horizontal(|ui| {
                 ui.radio_value(&mut d.settings.check_mode, CheckMode::Strict, "Strict");
-                ui.radio_value(&mut d.settings.check_mode, CheckMode::Relaxed, "Relaxed");
+                ui.radio_value(&mut d.settings.check_mode, CheckMode::Graduated, "Graduated");
             });
             let desc = match d.settings.check_mode {
-                CheckMode::Strict => "The reading must match exactly.",
-                CheckMode::Relaxed => {
-                    "Katakana is accepted, and so are slips that sound alike: voicing (か/が, は/ば/ぱ), \
-                     a missing long vowel or っ, small vs. big kana. A different sound is a mistake."
+                CheckMode::Strict => "The reading must match exactly (katakana for hiragana is fine).",
+                CheckMode::Graduated => {
+                    "Stricter as a word matures. Beginner: one wrong, missing or extra kana is forgiven \
+                     (readings of 3+ kana). Adept and Seasoned: only slips that sound alike, i.e. voicing \
+                     (か/が, は/ば/ぱ), a missing long vowel or っ, small vs. big kana. Expert and Mastered: \
+                     exact. A slip that spells another real word is always a mistake."
                 }
             };
             ui.label(RichText::new(desc).small().color(MUTED));
